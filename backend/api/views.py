@@ -1,3 +1,10 @@
-from django.shortcuts import render
+from rest_framework import viewsets
+from .models import McapLog
+from .serializers import McapLogSerializer
 
-# Create your views here.
+class McapLogViewSet(viewsets.ModelViewSet):
+    queryset = McapLog.objects.all()
+    serializer_class = McapLogSerializer
+
+
+
