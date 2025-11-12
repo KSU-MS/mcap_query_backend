@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Media files (uploaded files should not be in git)
+backend/media/
+media/
+*.mcap
