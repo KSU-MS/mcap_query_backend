@@ -11,6 +11,9 @@ class McapLogSerializer(serializers.ModelSerializer):
     event_type = serializers.PrimaryKeyRelatedField(
         queryset=EventType.objects.all(), allow_null=True, required=False
     )
+    file = serializers.FileField(write_only=True, required=False, help_text="MCAP file to upload and parse")
+    file_name = serializers.CharField(required=False, allow_blank=True)
+    
     class Meta:
         model = McapLog
         fields = ['id',
@@ -21,12 +24,16 @@ class McapLogSerializer(serializers.ModelSerializer):
                   'recovery_status',
                   'parse_status',
                   'captured_at',
+                  'start_time',
+                  'end_time',
                   'duration_seconds',
                   'channel_count',
+                  'channels',
                   'car',
                   'driver',
                   'event_type',
-                  'notes'
+                  'notes',
+                  'file'
                   ]
         
 class ParseSummaryRequestSerializer(serializers.Serializer):
