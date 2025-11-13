@@ -10,7 +10,7 @@ from .gpsparse import GpsParser
 import os
 import datetime
 from django.utils import timezone
-from django.contrib.gis.geos import Point, LineString
+from django.contrib.gis.geos import LineString
 from django.conf import settings
 
 class McapLogViewSet(viewsets.ModelViewSet):
@@ -71,9 +71,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
                     # LineString takes a list of (x, y) tuples, which is [longitude, latitude] in our case
                     # all_coordinates is already in [longitude, latitude] format
                     serializer.validated_data['lap_path'] = LineString(all_coordinates, srid=4326)
-                    
-                    # Note: location field is for user-tagged locations and can be set manually
-                    # In the future, it could be auto-populated from lap_path (e.g., start point, end point, or significant point)
                 
                 if parsed_data.get("start_time"):
                     # Convert timestamp to timezone-aware datetime
@@ -186,21 +183,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
                 }
             }
             features.append(path_feature)
-        
-        # Add location point if available
-        if mcap_log.location:
-            location_feature = {
-                'type': 'Feature',
-                'geometry': {
-                    'type': 'Point',
-                    'coordinates': [mcap_log.location.x, mcap_log.location.y]
-                },
-                'properties': {
-                    'type': 'tagged_location',
-                    'id': mcap_log.id
-                }
-            }
-            features.append(location_feature)
         
         # Return FeatureCollection
         geojson_response = {

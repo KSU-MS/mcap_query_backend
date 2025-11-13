@@ -1,5 +1,4 @@
 from rest_framework import serializers
-from django.contrib.gis.geos import Point
 from .models import McapLog, Car, Driver, EventType
 
 class McapLogSerializer(serializers.ModelSerializer):
@@ -31,7 +30,6 @@ class McapLogSerializer(serializers.ModelSerializer):
                   'duration_seconds',
                   'channel_count',
                   'channels',
-                  'location',
                   'lap_path',
                   'car',
                   'driver',
