@@ -51,31 +51,32 @@ This data can then be searched or displayed in a frontend dashboard
 ## To-Do Checklist
 
 ###  Core API
-- [ ] Create `McapLog` model  
-- [ ] Add `Car`, `Driver`, and `EventType` models  
-- [ ] Implement `McapLogSerializer`  
-- [ ] Implement `McapLogViewSet` with CRUD routes  
-- [ ] Add router URLs (`/mcap-logs/`)
+- [X] Create `McapLog` model  
+- [X] Add `Car`, `Driver`, and `EventType` models  
+- [X] Implement `McapLogSerializer`  
+- [X] Implement `McapLogViewSet` with CRUD routes  
+- [X] Add router URLs (`/mcap-logs/`)
 
 
 ###  Parsing
-- [ ] Use `mcap.reader` to extract:
-  - [ ] `captured_at` (from message start time)
-  - [ ] `duration_seconds`
-  - [ ] `channel_count`
-  - [ ] `channels_summary` (topics list)
-- [ ]  Parse GPS to get `race location`
+- [X] Use `mcap.reader` to extract:
+  - [X] `captured_at` (from message start time)
+  - [X] `duration_seconds`
+  - [X] `channel_count`
+  - [X] `channels_summary` (topics list)
+- [X]  Parse GPS to get `race location`
 - [ ] Background job system (Celary) to mass ingest data and parse it
 
 ###  Database + Metadata
-- [ ] Add fields for `recovery_status` and `parse_status`
-- [ ] Add foreign keys for `car`, `driver`, `event_type`
-- [ ] Add `notes`, `created_at`, and `updated_at`
-- [ ] Create migrations and migrate
+- [X] Add fields for `recovery_status` and `parse_status`
+- [X] Add foreign keys for `car`, `driver`, `event_type`
+- [X] Add `notes`, `created_at`, and `updated_at`
+- [X] Create migrations and migrate
 
 ###  Endpoints & Actions
+- [X] `POST /mcap-logs/{id}/geojson/` - runs the Visvalingam algo to find important points and returns geoJson
 - [ ] `POST /mcap-logs/` — upload + recover + parse  
-- [ ] `GET /mcap-logs/` — list all logs with filters  
+- [X] `GET /mcap-logs/` — list all logs with filters  
 - [ ] `GET /mcap-logs/{id}/` — view single log  
 - [ ] `PATCH /mcap-logs/{id}/` — update tags  
 - [ ] `GET /mcap-logs/{id}/channels/` — list channels  
