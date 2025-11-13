@@ -12,6 +12,8 @@ import datetime
 from django.utils import timezone
 from django.contrib.gis.geos import LineString
 from django.conf import settings
+from drf_yasg.utils import swagger_auto_schema
+from drf_yasg import openapi
 
 class McapLogViewSet(viewsets.ModelViewSet):
     queryset = McapLog.objects.all()
@@ -93,6 +95,37 @@ class McapLogViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Returns simplified LineString as GeoJSON. Reads from DB if available, otherwise parses from MCAP file. Uses PostGIS ST_SimplifyVW for simplification.",
+        manual_parameters=[
+            openapi.Parameter(
+                'tolerance',
+                openapi.IN_QUERY,
+                description="Simplification tolerance in degrees (default: 0.0001, roughly 11 meters). Higher values result in more aggressive simplification.",
+                type=openapi.TYPE_NUMBER,
+                required=False,
+            ),
+        ],
+        responses={
+            200: openapi.Response(
+                description="GeoJSON FeatureCollection with simplified LineString",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'type': openapi.Schema(type=openapi.TYPE_STRING, example='FeatureCollection'),
+                        'features': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
+                        ),
+                    }
+                )
+            ),
+            404: openapi.Response(description="No GPS path available for this log"),
+            500: openapi.Response(description="Failed to parse MCAP file"),
+        },
+        tags=['MCAP Logs']
+    )
     @action(detail=True, methods=['get'], url_path='geojson')
     def geojson(self, request, pk=None):
         """
@@ -194,7 +227,33 @@ class McapLogViewSet(viewsets.ModelViewSet):
 
 
 class ParseSummaryView(APIView):
+    @swagger_auto_schema(
+        request_body=ParseSummaryRequestSerializer,
+        operation_description="Parse MCAP file summary without creating a database record. Returns channel information, timestamps, and duration.",
+        responses={
+            200: openapi.Response(
+                description="Parsed MCAP file summary",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'channels': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_STRING)),
+                        'channel_count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'start_time': openapi.Schema(type=openapi.TYPE_NUMBER),
+                        'end_time': openapi.Schema(type=openapi.TYPE_NUMBER),
+                        'duration': openapi.Schema(type=openapi.TYPE_NUMBER),
+                        'formatted_date': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: openapi.Response(description="Invalid request data"),
+        },
+        tags=['Parsing']
+    )
     def post(self, request):
+        """
+        Parse MCAP file summary without creating a database record.
+        Returns channel information, timestamps, and duration.
+        """
         serializer = ParseSummaryRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 

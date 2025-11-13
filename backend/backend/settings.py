@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     'django.contrib.gis',  # GeoDjango for PostGIS
     'rest_framework',
     'corsheaders',
+    'drf_yasg',  # Swagger/OpenAPI documentation
     'api',
 ]
 
@@ -177,3 +178,17 @@ CORS_ALLOW_METHODS = [
     'POST',
     'PUT',
 ]
+
+# drf-yasg (Swagger/OpenAPI) settings
+SWAGGER_SETTINGS = {
+    'SECURITY_DEFINITIONS': {
+        'Basic': {
+            'type': 'basic'
+        }
+    },
+    'USE_SESSION_AUTH': False,
+}
+
+REDOC_SETTINGS = {
+    'LAZY_RENDERING': False,
+}
