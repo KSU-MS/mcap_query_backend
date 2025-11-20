@@ -16,14 +16,183 @@ from .gpsparse import GpsParser
 import os
 import datetime
 from django.utils import timezone
-from django.contrib.gis.geos import LineString
+from django.contrib.gis.geos import LineString, Point, Polygon
 from django.conf import settings
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+from django.db.models import Q
 
 class McapLogViewSet(viewsets.ModelViewSet):
     queryset = McapLog.objects.all()
     serializer_class = McapLogSerializer
+    
+    def get_queryset(self):
+        """
+        Override to support query parameter filtering.
+        Supported query parameters:
+        - start_date: Filter logs captured on or after this date (YYYY-MM-DD)
+        - end_date: Filter logs captured on or before this date (YYYY-MM-DD)
+        - car_id: Filter by car ID
+        - event_type_id: Filter by event type ID
+        - location: Filter by geographic bounding box (format: min_lon,min_lat,max_lon,max_lat)
+        - driver_id: Filter by driver ID
+        - parse_status: Filter by parse status
+        - recovery_status: Filter by recovery status
+        """
+        queryset = McapLog.objects.all()
+        
+        # Date filtering - using captured_at field
+        start_date = self.request.query_params.get('start_date', None)
+        if start_date:
+            try:
+                from django.utils.dateparse import parse_date
+                date_obj = parse_date(start_date)
+                if date_obj:
+                    # Start of day
+                    start_datetime = timezone.make_aware(
+                        datetime.datetime.combine(date_obj, datetime.time.min)
+                    )
+                    queryset = queryset.filter(captured_at__gte=start_datetime)
+            except (ValueError, TypeError):
+                pass  # Ignore invalid date formats
+        
+        end_date = self.request.query_params.get('end_date', None)
+        if end_date:
+            try:
+                from django.utils.dateparse import parse_date
+                date_obj = parse_date(end_date)
+                if date_obj:
+                    # End of day
+                    end_datetime = timezone.make_aware(
+                        datetime.datetime.combine(date_obj, datetime.time.max)
+                    )
+                    queryset = queryset.filter(captured_at__lte=end_datetime)
+            except (ValueError, TypeError):
+                pass  # Ignore invalid date formats
+        
+        # Filter by car
+        car_id = self.request.query_params.get('car_id', None)
+        if car_id:
+            try:
+                queryset = queryset.filter(car_id=int(car_id))
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by event type
+        event_type_id = self.request.query_params.get('event_type_id', None)
+        if event_type_id:
+            try:
+                queryset = queryset.filter(event_type_id=int(event_type_id))
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by driver
+        driver_id = self.request.query_params.get('driver_id', None)
+        if driver_id:
+            try:
+                queryset = queryset.filter(driver_id=int(driver_id))
+            except (ValueError, TypeError):
+                pass
+        
+        # Filter by parse status
+        parse_status = self.request.query_params.get('parse_status', None)
+        if parse_status:
+            queryset = queryset.filter(parse_status=parse_status)
+        
+        # Filter by recovery status
+        recovery_status = self.request.query_params.get('recovery_status', None)
+        if recovery_status:
+            queryset = queryset.filter(recovery_status=recovery_status)
+        
+        # Geographic location filtering (bounding box)
+        # Format: min_lon,min_lat,max_lon,max_lat
+        location = self.request.query_params.get('location', None)
+        if location:
+            try:
+                coords = [float(x.strip()) for x in location.split(',')]
+                if len(coords) == 4:
+                    min_lon, min_lat, max_lon, max_lat = coords
+                    # Create bounding box polygon
+                    bbox = Polygon.from_bbox((min_lon, min_lat, max_lon, max_lat))
+                    # Filter logs where lap_path intersects with bounding box
+                    queryset = queryset.filter(lap_path__intersects=bbox)
+            except (ValueError, TypeError, IndexError):
+                pass  # Ignore invalid location formats
+        
+        return queryset.order_by('-created_at')
+    
+    @swagger_auto_schema(
+        operation_description="List MCAP logs with optional filtering by date, location, car, event, and more.",
+        manual_parameters=[
+            openapi.Parameter(
+                'start_date',
+                openapi.IN_QUERY,
+                description="Filter logs captured on or after this date (format: YYYY-MM-DD)",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                'end_date',
+                openapi.IN_QUERY,
+                description="Filter logs captured on or before this date (format: YYYY-MM-DD)",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                'car_id',
+                openapi.IN_QUERY,
+                description="Filter by car ID",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'event_type_id',
+                openapi.IN_QUERY,
+                description="Filter by event type ID",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'driver_id',
+                openapi.IN_QUERY,
+                description="Filter by driver ID",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                'location',
+                openapi.IN_QUERY,
+                description="Filter by geographic bounding box (format: min_lon,min_lat,max_lon,max_lat). Returns logs whose GPS path intersects with the bounding box.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                'parse_status',
+                openapi.IN_QUERY,
+                description="Filter by parse status (e.g., 'completed', 'pending', 'error:...')",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                'recovery_status',
+                openapi.IN_QUERY,
+                description="Filter by recovery status",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+        ],
+        tags=['MCAP Logs']
+    )
+    def list(self, request, *args, **kwargs):
+        """
+        List MCAP logs with optional filtering.
+        All query parameters are optional and can be combined.
+        Examples:
+        - /api/mcap-logs/?start_date=2025-01-01&end_date=2025-01-31
+        - /api/mcap-logs/?car_id=1&event_type_id=2
+        - /api/mcap-logs/?location=-122.5,37.7,-122.3,37.9
+        """
+        return super().list(request, *args, **kwargs)
     
     def create(self, request, *args, **kwargs):
         """
