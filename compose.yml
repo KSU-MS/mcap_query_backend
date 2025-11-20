@@ -18,6 +18,23 @@ services:
       timeout: 5s
       retries: 5
 
+  # Redis is already running on port 6379 (container: redis-queue)
+  # Using existing Redis instance instead of creating a new one
+  # If you need a separate Redis, uncomment below and change port to 6380
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: always
+  #   ports:
+  #     - "6380:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
 volumes:
   postgres_data:
+  # redis_data:  # Uncomment if using separate Redis
 
