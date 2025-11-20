@@ -9,12 +9,19 @@ from .serializers import (
     ParseSummaryRequestSerializer,
     CarSerializer,
     DriverSerializer,
-    EventTypeSerializer
+    EventTypeSerializer,
+    DownloadRequestSerializer
 )
 from .parser import Parser
 from .gpsparse import GpsParser
+from .tasks import parse_mcap_file
+from celery.result import AsyncResult
 import os
 import datetime
+import zipfile
+import tempfile
+from pathlib import Path
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django.contrib.gis.geos import LineString, Point, Polygon
 from django.conf import settings
@@ -222,41 +229,18 @@ class McapLogViewSet(viewsets.ModelViewSet):
             
             saved_file_path = str(file_path)
             
+            # Calculate and store file size
+            file_size = file_path.stat().st_size
+            serializer.validated_data['file_size'] = file_size
+            
             # Store the URI in original_uri
             serializer.validated_data['original_uri'] = f"{settings.MEDIA_URL}mcap_logs/{file_name}"
             # Set file_name from uploaded file if not already provided
             if 'file_name' not in serializer.validated_data or not serializer.validated_data.get('file_name'):
                 serializer.validated_data['file_name'] = uploaded_file.name
             
-            # Parse the uploaded file
-            try:
-                parsed_data = Parser.parse_stuff(saved_file_path)
-                
-                # Populate fields from parsed data
-                serializer.validated_data['channels'] = parsed_data.get("channels", [])
-                serializer.validated_data['channel_count'] = parsed_data.get("channel_count", 0)
-                serializer.validated_data['start_time'] = parsed_data.get("start_time")
-                serializer.validated_data['end_time'] = parsed_data.get("end_time")
-                serializer.validated_data['duration_seconds'] = parsed_data.get("duration", 0)
-                
-                # Parse GPS coordinates from the file
-                gps_data = GpsParser.parse_gps(saved_file_path)
-                all_coordinates = gps_data.get("all_coordinates", [])
-                
-                # Create LineString from all GPS coordinates for map preview
-                if all_coordinates:
-                    # LineString takes a list of (x, y) tuples, which is [longitude, latitude] in our case
-                    # all_coordinates is already in [longitude, latitude] format
-                    serializer.validated_data['lap_path'] = LineString(all_coordinates, srid=4326)
-                
-                if parsed_data.get("start_time"):
-                    # Convert timestamp to timezone-aware datetime
-                    naive_dt = datetime.datetime.fromtimestamp(parsed_data.get("start_time"))
-                    serializer.validated_data['captured_at'] = timezone.make_aware(naive_dt)
-                
-                serializer.validated_data['parse_status'] = "completed"
-            except Exception as e:
-                serializer.validated_data['parse_status'] = f"error: {str(e)}"
+            # Set parse_status to pending - will be processed in background
+            serializer.validated_data['parse_status'] = "pending"
         else:
             # If no file uploaded, ensure file_name is set if provided in request
             if 'file_name' not in serializer.validated_data or not serializer.validated_data.get('file_name'):
@@ -266,7 +250,17 @@ class McapLogViewSet(viewsets.ModelViewSet):
         # Remove 'file' from validated_data since it's not a model field
         serializer.validated_data.pop('file', None)
         
+        # Create the record first
         self.perform_create(serializer)
+        mcap_log_instance = serializer.instance
+        
+        # If a file was uploaded, trigger background parsing
+        if saved_file_path:
+            task = parse_mcap_file.delay(mcap_log_instance.id, saved_file_path)
+            # Store the task ID for status tracking
+            mcap_log_instance.parse_task_id = task.id
+            mcap_log_instance.save(update_fields=['parse_task_id'])
+        
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     
@@ -422,6 +416,410 @@ class McapLogViewSet(viewsets.ModelViewSet):
         }
         
         return Response(geojson_response, status=status.HTTP_200_OK)
+    
+    @swagger_auto_schema(
+        method='post',
+        request_body=DownloadRequestSerializer,
+        operation_description="Download selected MCAP log files as a ZIP archive. Accepts a list of MCAP log IDs.",
+        responses={
+            200: openapi.Response(
+                description="ZIP file containing the selected MCAP log files",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    format=openapi.FORMAT_BINARY
+                )
+            ),
+            400: openapi.Response(description="Invalid request data or no files found"),
+            404: openapi.Response(description="One or more log IDs not found"),
+        },
+        tags=['MCAP Logs']
+    )
+    @action(detail=False, methods=['post'], url_path='download')
+    def download(self, request):
+        """
+        Download selected MCAP log files as a ZIP archive.
+        Accepts a POST request with a list of log IDs in the request body.
+        Example: {"ids": [1, 2, 3]}
+        """
+        serializer = DownloadRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        log_ids = serializer.validated_data['ids']
+        
+        # Get the McapLog objects
+        mcap_logs = McapLog.objects.filter(id__in=log_ids)
+        
+        if not mcap_logs.exists():
+            return Response(
+                {'error': 'No logs found with the provided IDs'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check if all requested IDs were found
+        found_ids = set(mcap_logs.values_list('id', flat=True))
+        requested_ids = set(log_ids)
+        missing_ids = requested_ids - found_ids
+        
+        if missing_ids:
+            return Response(
+                {'error': f'Log IDs not found: {list(missing_ids)}'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Create a temporary file for the ZIP
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_file_path = temp_file.name
+        temp_file.close()
+        
+        files_added = 0
+        files_missing = []
+        
+        try:
+            # Create ZIP file
+            with zipfile.ZipFile(temp_file_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for mcap_log in mcap_logs:
+                    try:
+                        if not mcap_log.original_uri:
+                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - no file URI")
+                            continue
+                        
+                        # Extract file path from original_uri
+                        # original_uri format: /media/mcap_logs/filename.mcap
+                        if mcap_log.original_uri.startswith(settings.MEDIA_URL):
+                            file_name = mcap_log.original_uri.replace(settings.MEDIA_URL, '', 1)  # Only replace first occurrence
+                            file_path = Path(settings.MEDIA_ROOT) / file_name
+                        elif mcap_log.original_uri.startswith('/'):
+                            # Handle absolute paths starting with /
+                            file_path = Path(mcap_log.original_uri)
+                        else:
+                            # Handle relative paths or other formats
+                            file_path = Path(settings.MEDIA_ROOT) / mcap_log.original_uri
+                        
+                        # Resolve the path to handle any symlinks or relative paths
+                        file_path = file_path.resolve()
+                        
+                        # Check if file exists
+                        if not file_path.exists():
+                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - file not found at {file_path}")
+                            continue
+                        
+                        # Check if it's actually a file (not a directory)
+                        if not file_path.is_file():
+                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - path is not a file")
+                            continue
+                        
+                        # Add file to ZIP with original filename
+                        zip_file.write(str(file_path), arcname=mcap_log.file_name)
+                        files_added += 1
+                    except Exception as file_error:
+                        # Handle individual file errors gracefully
+                        files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - error: {str(file_error)}")
+                        continue
+            
+            # If no files were added, return error
+            if files_added == 0:
+                os.unlink(temp_file_path)
+                return Response(
+                    {
+                        'error': 'No files could be added to the ZIP archive',
+                        'missing_files': files_missing
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Generate download filename
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            zip_filename = f'mcap_logs_{timestamp}.zip'
+            
+            # Read the ZIP file into memory for response
+            # This ensures proper cleanup of the temp file
+            with open(temp_file_path, 'rb') as zip_file:
+                zip_content = zip_file.read()
+            
+            # Delete temp file now that we have the content
+            os.unlink(temp_file_path)
+            
+            # Create response with the ZIP content
+            response = HttpResponse(zip_content, content_type='application/zip')
+            response['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
+            response['Content-Length'] = len(zip_content)
+            
+            # Add info about missing files in response headers if any
+            if files_missing:
+                response['X-Missing-Files'] = ', '.join(files_missing)
+            
+            return response
+            
+        except Exception as e:
+            # Clean up temp file on error
+            if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+            
+            # Log the full error for debugging
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"Download error: {str(e)}\n{error_details}")
+            
+            return Response(
+                {'error': f'Failed to create ZIP archive: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Get the parsing job status for a specific MCAP log.",
+        responses={
+            200: openapi.Response(
+                description="Job status information",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'log_id': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'parse_status': openapi.Schema(type=openapi.TYPE_STRING, description="pending, processing, completed, or error"),
+                        'parse_task_id': openapi.Schema(type=openapi.TYPE_STRING, description="Celery task ID"),
+                        'task_state': openapi.Schema(type=openapi.TYPE_STRING, description="Celery task state: PENDING, STARTED, SUCCESS, FAILURE, RETRY"),
+                        'task_info': openapi.Schema(type=openapi.TYPE_OBJECT, description="Additional task information"),
+                    }
+                )
+            ),
+            404: openapi.Response(description="Log not found"),
+        },
+        tags=['MCAP Logs']
+    )
+    @action(detail=True, methods=['get'], url_path='job-status')
+    def job_status(self, request, pk=None):
+        """
+        Get the parsing job status for a specific MCAP log.
+        Returns both the database parse_status and Celery task status.
+        """
+        mcap_log = self.get_object()
+        
+        response_data = {
+            'log_id': mcap_log.id,
+            'file_name': mcap_log.file_name,
+            'parse_status': mcap_log.parse_status,
+            'parse_task_id': mcap_log.parse_task_id,
+        }
+        
+        # If there's a task ID, get detailed Celery task status
+        if mcap_log.parse_task_id:
+            try:
+                task_result = AsyncResult(mcap_log.parse_task_id)
+                response_data['task_state'] = task_result.state
+                response_data['task_info'] = {
+                    'ready': task_result.ready(),
+                    'successful': task_result.successful() if task_result.ready() else None,
+                    'failed': task_result.failed() if task_result.ready() else None,
+                }
+                
+                # Add result or error if available
+                if task_result.ready():
+                    if task_result.successful():
+                        response_data['task_info']['result'] = task_result.result
+                    elif task_result.failed():
+                        response_data['task_info']['error'] = str(task_result.info)
+            except Exception as e:
+                response_data['task_info'] = {'error': f'Could not fetch task status: {str(e)}'}
+        else:
+            response_data['task_state'] = None
+            response_data['task_info'] = {'message': 'No task ID available'}
+        
+        return Response(response_data, status=status.HTTP_200_OK)
+    
+    @swagger_auto_schema(
+        method='post',
+        operation_description="Upload multiple MCAP files at once. Each file will be processed in the background.",
+        manual_parameters=[
+            openapi.Parameter(
+                'files',
+                openapi.IN_FORM,
+                description="Multiple MCAP files to upload",
+                type=openapi.TYPE_ARRAY,
+                items=openapi.Items(type=openapi.TYPE_FILE),
+                required=True,
+            ),
+        ],
+        responses={
+            200: openapi.Response(
+                description="List of created MCAP log records with their job statuses",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'results': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
+                        ),
+                    }
+                )
+            ),
+            400: openapi.Response(description="No files provided"),
+        },
+        tags=['MCAP Logs']
+    )
+    @action(detail=False, methods=['post'], url_path='batch-upload')
+    def batch_upload(self, request):
+        """
+        Upload multiple MCAP files at once.
+        Each file will create a database record and trigger a background parsing job.
+        Returns a list of created records with their job statuses.
+        """
+        # Get all uploaded files
+        uploaded_files = request.FILES.getlist('files')
+        
+        if not uploaded_files:
+            return Response(
+                {'error': 'No files provided. Use multipart/form-data with "files" field containing one or more files.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        results = []
+        media_dir = settings.MEDIA_ROOT / 'mcap_logs'
+        media_dir.mkdir(parents=True, exist_ok=True)
+        
+        for uploaded_file in uploaded_files:
+            try:
+                # Generate unique filename
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                file_name = f"{timestamp}_{uploaded_file.name}"
+                file_path = media_dir / file_name
+                
+                # Save the uploaded file
+                with open(file_path, 'wb+') as destination:
+                    for chunk in uploaded_file.chunks():
+                        destination.write(chunk)
+                
+                saved_file_path = str(file_path)
+                
+                # Calculate file size
+                file_size = file_path.stat().st_size
+                
+                # Create database record
+                mcap_log = McapLog.objects.create(
+                    file_name=uploaded_file.name,
+                    original_uri=f"{settings.MEDIA_URL}mcap_logs/{file_name}",
+                    file_size=file_size,
+                    parse_status="pending",
+                    recovery_status="pending",
+                )
+                
+                # Trigger background parsing job
+                task = parse_mcap_file.delay(mcap_log.id, saved_file_path)
+                mcap_log.parse_task_id = task.id
+                mcap_log.save(update_fields=['parse_task_id'])
+                
+                # Serialize the result
+                serializer = self.get_serializer(mcap_log)
+                results.append(serializer.data)
+                
+            except Exception as e:
+                # If one file fails, continue with others
+                results.append({
+                    'file_name': uploaded_file.name if uploaded_file else 'unknown',
+                    'error': str(e),
+                    'parse_status': 'error'
+                })
+        
+        return Response({
+            'count': len(results),
+            'results': results
+        }, status=status.HTTP_201_CREATED)
+    
+    @swagger_auto_schema(
+        method='get',
+        operation_description="Get parsing job statuses for all MCAP logs. Optionally filter by status.",
+        manual_parameters=[
+            openapi.Parameter(
+                'status',
+                openapi.IN_QUERY,
+                description="Filter by parse status (pending, processing, completed, or error:*)",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+        ],
+        responses={
+            200: openapi.Response(
+                description="List of job statuses",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'results': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
+                        ),
+                    }
+                )
+            ),
+        },
+        tags=['MCAP Logs']
+    )
+    @action(detail=False, methods=['get'], url_path='job-statuses')
+    def job_statuses(self, request):
+        """
+        Get parsing job statuses for all MCAP logs.
+        Optionally filter by parse_status query parameter.
+        """
+        queryset = McapLog.objects.all()
+        
+        # Filter by status if provided
+        status_filter = request.query_params.get('status', None)
+        if status_filter:
+            if status_filter.startswith('error'):
+                # Match any error status
+                queryset = queryset.filter(parse_status__startswith='error')
+            else:
+                queryset = queryset.filter(parse_status=status_filter)
+        
+        # Order by created_at descending (newest first)
+        queryset = queryset.order_by('-created_at')
+        
+        # Build response with job statuses
+        results = []
+        for mcap_log in queryset:
+            try:
+                job_data = {
+                    'log_id': mcap_log.id,
+                    'file_name': mcap_log.file_name,
+                    'parse_status': mcap_log.parse_status,
+                    'parse_task_id': mcap_log.parse_task_id,
+                    'created_at': mcap_log.created_at.isoformat() if mcap_log.created_at else None,
+                }
+                
+                # Get Celery task status if task ID exists
+                if mcap_log.parse_task_id:
+                    try:
+                        task_result = AsyncResult(mcap_log.parse_task_id)
+                        job_data['task_state'] = task_result.state
+                        job_data['task_ready'] = task_result.ready()
+                    except Exception as e:
+                        # If we can't get task status, still include the record
+                        job_data['task_state'] = 'UNKNOWN'
+                        job_data['task_error'] = str(e)
+                else:
+                    job_data['task_state'] = None
+                
+                results.append(job_data)
+            except Exception as e:
+                # If there's an error processing a single record, log it but continue
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Error processing log {mcap_log.id}: {str(e)}")
+                # Still add a basic record
+                results.append({
+                    'log_id': mcap_log.id,
+                    'file_name': getattr(mcap_log, 'file_name', 'unknown'),
+                    'parse_status': getattr(mcap_log, 'parse_status', 'unknown'),
+                    'error': str(e)
+                })
+        
+        return Response({
+            'count': len(results),
+            'results': results
+        }, status=status.HTTP_200_OK)
 
 
 class ParseSummaryView(APIView):

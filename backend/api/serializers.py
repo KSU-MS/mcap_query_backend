@@ -57,12 +57,14 @@ class McapLogSerializer(serializers.ModelSerializer):
                   'recovered_uri',
                   'recovery_status',
                   'parse_status',
+                  'parse_task_id',
                   'captured_at',
                   'start_time',
                   'end_time',
                   'duration_seconds',
                   'channel_count',
                   'channels',
+                  'file_size',
                   'lap_path',
                   'car',
                   'driver',
@@ -77,4 +79,11 @@ class McapLogSerializer(serializers.ModelSerializer):
 class ParseSummaryRequestSerializer(serializers.Serializer):
     path = serializers.CharField()
     
+
+class DownloadRequestSerializer(serializers.Serializer):
+    ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        min_length=1,
+        help_text="List of MCAP log IDs to download"
+    )
 

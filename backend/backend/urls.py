@@ -37,9 +37,13 @@ urlpatterns = [
     re_path(r'^swagger/$', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
     re_path(r'^redoc/$', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
     
-    # API routes
+    # API routes with /api/ prefix
+    path('api/', include(router.urls)),
+    path("api/parse/summary/", ParseSummaryView.as_view(), name="parse-summary"),
+    
+    # Also include at root for backward compatibility
     path('', include(router.urls)),
-    path("parse/summary/", ParseSummaryView.as_view(), name="parse-summary"),
+    path("parse/summary/", ParseSummaryView.as_view(), name="parse-summary-root"),
 ]
 
 # Serve media files in development
