@@ -86,4 +86,10 @@ class DownloadRequestSerializer(serializers.Serializer):
         min_length=1,
         help_text="List of MCAP log IDs to download"
     )
+    format = serializers.ChoiceField(
+        choices=['mcap', 'csv_omni', 'csv_tvn'],
+        default='mcap',
+        required=False,
+        help_text="Output format: 'mcap' for original files, 'csv_omni' or 'csv_tvn' for CSV conversion"
+    )
 

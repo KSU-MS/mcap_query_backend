@@ -14,7 +14,7 @@ from .serializers import (
 )
 from .parser import Parser
 from .gpsparse import GpsParser
-from .tasks import parse_mcap_file
+from .tasks import parse_mcap_file, convert_mcap_to_csv
 from celery.result import AsyncResult
 import os
 import datetime
@@ -25,8 +25,6 @@ from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django.contrib.gis.geos import LineString, Point, Polygon
 from django.conf import settings
-from drf_yasg.utils import swagger_auto_schema
-from drf_yasg import openapi
 from django.db.models import Q
 
 class McapLogViewSet(viewsets.ModelViewSet):
@@ -35,161 +33,128 @@ class McapLogViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         """
-        Override to support query parameter filtering.
-        Supported query parameters:
+        Override DRF's get_queryset() to add custom filtering logic.
+        
+        This method is called automatically by DRF for list(), retrieve(), update(), etc.
+        It does NOT need @action decorator because it's not an endpoint - it's an internal helper.
+        
+        Supported query parameters (all optional, can be combined):
+        - search: Text search in file_name and notes (case-insensitive)
         - start_date: Filter logs captured on or after this date (YYYY-MM-DD)
         - end_date: Filter logs captured on or before this date (YYYY-MM-DD)
-        - car_id: Filter by car ID
-        - event_type_id: Filter by event type ID
+        - car_id: Filter by car ID (integer)
+        - event_type_id: Filter by event type ID (integer)
+        - driver_id: Filter by driver ID (integer)
+        - parse_status: Filter by parse status (string, e.g., "completed", "pending")
+        - recovery_status: Filter by recovery status (string)
         - location: Filter by geographic bounding box (format: min_lon,min_lat,max_lon,max_lat)
-        - driver_id: Filter by driver ID
-        - parse_status: Filter by parse status
-        - recovery_status: Filter by recovery status
+        - page: Page number for pagination (default: 1, handled by DRF pagination)
+        
+        Returns: Filtered queryset ordered by creation date (newest first)
         """
+        # Start with all McapLog objects
         queryset = McapLog.objects.all()
         
-        # Date filtering - using captured_at field
+        # ===== TEXT SEARCH =====
+        # Search in file_name and notes fields (case-insensitive partial match)
+        # Example: ?search=race will find "race_log.mcap" or notes containing "race"
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(file_name__icontains=search) | Q(notes__icontains=search)
+            )
+        
+        # ===== DATE RANGE FILTERING =====
+        # Filter logs by capture date range using captured_at field
+        # start_date: Include logs from this date onwards (start of day)
         start_date = self.request.query_params.get('start_date', None)
         if start_date:
             try:
                 from django.utils.dateparse import parse_date
                 date_obj = parse_date(start_date)
                 if date_obj:
-                    # Start of day
+                    # Convert to start of day (00:00:00) with timezone awareness
                     start_datetime = timezone.make_aware(
                         datetime.datetime.combine(date_obj, datetime.time.min)
                     )
                     queryset = queryset.filter(captured_at__gte=start_datetime)
             except (ValueError, TypeError):
-                pass  # Ignore invalid date formats
+                pass  # Ignore invalid date formats silently
         
+        # end_date: Include logs up to this date (end of day)
         end_date = self.request.query_params.get('end_date', None)
         if end_date:
             try:
                 from django.utils.dateparse import parse_date
                 date_obj = parse_date(end_date)
                 if date_obj:
-                    # End of day
+                    # Convert to end of day (23:59:59) with timezone awareness
                     end_datetime = timezone.make_aware(
                         datetime.datetime.combine(date_obj, datetime.time.max)
                     )
                     queryset = queryset.filter(captured_at__lte=end_datetime)
             except (ValueError, TypeError):
-                pass  # Ignore invalid date formats
+                pass  # Ignore invalid date formats silently
         
-        # Filter by car
+        # ===== FOREIGN KEY FILTERING =====
+        # Filter by car (foreign key relationship)
         car_id = self.request.query_params.get('car_id', None)
         if car_id:
             try:
                 queryset = queryset.filter(car_id=int(car_id))
             except (ValueError, TypeError):
-                pass
+                pass  # Ignore invalid car_id values
         
-        # Filter by event type
+        # Filter by event type (foreign key relationship)
         event_type_id = self.request.query_params.get('event_type_id', None)
         if event_type_id:
             try:
                 queryset = queryset.filter(event_type_id=int(event_type_id))
             except (ValueError, TypeError):
-                pass
+                pass  # Ignore invalid event_type_id values
         
-        # Filter by driver
+        # Filter by driver (foreign key relationship)
         driver_id = self.request.query_params.get('driver_id', None)
         if driver_id:
             try:
                 queryset = queryset.filter(driver_id=int(driver_id))
             except (ValueError, TypeError):
-                pass
+                pass  # Ignore invalid driver_id values
         
-        # Filter by parse status
+        # ===== STATUS FILTERING =====
+        # Filter by parse status (e.g., "pending", "processing", "completed", "error:...")
         parse_status = self.request.query_params.get('parse_status', None)
         if parse_status:
             queryset = queryset.filter(parse_status=parse_status)
         
-        # Filter by recovery status
+        # Filter by recovery status (e.g., "pending", "completed", "failed")
         recovery_status = self.request.query_params.get('recovery_status', None)
         if recovery_status:
             queryset = queryset.filter(recovery_status=recovery_status)
         
-        # Geographic location filtering (bounding box)
-        # Format: min_lon,min_lat,max_lon,max_lat
+        # ===== GEOGRAPHIC LOCATION FILTERING =====
+        # Filter logs by geographic bounding box (PostGIS spatial query)
+        # Format: min_lon,min_lat,max_lon,max_lat (comma-separated)
+        # Example: ?location=-122.5,37.7,-122.3,37.9
+        # Returns logs whose lap_path (GPS LineString) intersects with the bounding box
         location = self.request.query_params.get('location', None)
         if location:
             try:
+                # Parse comma-separated coordinates
                 coords = [float(x.strip()) for x in location.split(',')]
                 if len(coords) == 4:
                     min_lon, min_lat, max_lon, max_lat = coords
-                    # Create bounding box polygon
+                    # Create bounding box polygon using PostGIS
                     bbox = Polygon.from_bbox((min_lon, min_lat, max_lon, max_lat))
                     # Filter logs where lap_path intersects with bounding box
                     queryset = queryset.filter(lap_path__intersects=bbox)
             except (ValueError, TypeError, IndexError):
-                pass  # Ignore invalid location formats
+                pass  # Ignore invalid location formats silently
         
+        # Return filtered queryset ordered by creation date (newest first)
+        # Pagination is handled automatically by DRF after this method returns
         return queryset.order_by('-created_at')
     
-    @swagger_auto_schema(
-        operation_description="List MCAP logs with optional filtering by date, location, car, event, and more.",
-        manual_parameters=[
-            openapi.Parameter(
-                'start_date',
-                openapi.IN_QUERY,
-                description="Filter logs captured on or after this date (format: YYYY-MM-DD)",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-            openapi.Parameter(
-                'end_date',
-                openapi.IN_QUERY,
-                description="Filter logs captured on or before this date (format: YYYY-MM-DD)",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-            openapi.Parameter(
-                'car_id',
-                openapi.IN_QUERY,
-                description="Filter by car ID",
-                type=openapi.TYPE_INTEGER,
-                required=False,
-            ),
-            openapi.Parameter(
-                'event_type_id',
-                openapi.IN_QUERY,
-                description="Filter by event type ID",
-                type=openapi.TYPE_INTEGER,
-                required=False,
-            ),
-            openapi.Parameter(
-                'driver_id',
-                openapi.IN_QUERY,
-                description="Filter by driver ID",
-                type=openapi.TYPE_INTEGER,
-                required=False,
-            ),
-            openapi.Parameter(
-                'location',
-                openapi.IN_QUERY,
-                description="Filter by geographic bounding box (format: min_lon,min_lat,max_lon,max_lat). Returns logs whose GPS path intersects with the bounding box.",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-            openapi.Parameter(
-                'parse_status',
-                openapi.IN_QUERY,
-                description="Filter by parse status (e.g., 'completed', 'pending', 'error:...')",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-            openapi.Parameter(
-                'recovery_status',
-                openapi.IN_QUERY,
-                description="Filter by recovery status",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-        ],
-        tags=['MCAP Logs']
-    )
     def list(self, request, *args, **kwargs):
         """
         List MCAP logs with optional filtering.
@@ -264,44 +229,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     
-    @swagger_auto_schema(
-        method='get',
-        operation_description="Returns LineString as GeoJSON. Reads from DB if available, otherwise parses from MCAP file. Optionally uses PostGIS ST_SimplifyVW for simplification.",
-        manual_parameters=[
-            openapi.Parameter(
-                'tolerance',
-                openapi.IN_QUERY,
-                description="Simplification tolerance in degrees (default: 0.00001, roughly 1.1 meters). Set to 0 or omit 'simplify' parameter to return full path. Higher values result in more aggressive simplification.",
-                type=openapi.TYPE_NUMBER,
-                required=False,
-            ),
-            openapi.Parameter(
-                'simplify',
-                openapi.IN_QUERY,
-                description="Whether to apply simplification (default: false). Set to 'true' to enable simplification.",
-                type=openapi.TYPE_BOOLEAN,
-                required=False,
-            ),
-        ],
-        responses={
-            200: openapi.Response(
-                description="GeoJSON FeatureCollection with simplified LineString",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'type': openapi.Schema(type=openapi.TYPE_STRING, example='FeatureCollection'),
-                        'features': openapi.Schema(
-                            type=openapi.TYPE_ARRAY,
-                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
-                        ),
-                    }
-                )
-            ),
-            404: openapi.Response(description="No GPS path available for this log"),
-            500: openapi.Response(description="Failed to parse MCAP file"),
-        },
-        tags=['MCAP Logs']
-    )
     @action(detail=True, methods=['get'], url_path='geojson')
     def geojson(self, request, pk=None):
         """
@@ -417,34 +344,19 @@ class McapLogViewSet(viewsets.ModelViewSet):
         
         return Response(geojson_response, status=status.HTTP_200_OK)
     
-    @swagger_auto_schema(
-        method='post',
-        request_body=DownloadRequestSerializer,
-        operation_description="Download selected MCAP log files as a ZIP archive. Accepts a list of MCAP log IDs.",
-        responses={
-            200: openapi.Response(
-                description="ZIP file containing the selected MCAP log files",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_STRING,
-                    format=openapi.FORMAT_BINARY
-                )
-            ),
-            400: openapi.Response(description="Invalid request data or no files found"),
-            404: openapi.Response(description="One or more log IDs not found"),
-        },
-        tags=['MCAP Logs']
-    )
     @action(detail=False, methods=['post'], url_path='download')
     def download(self, request):
         """
         Download selected MCAP log files as a ZIP archive.
-        Accepts a POST request with a list of log IDs in the request body.
-        Example: {"ids": [1, 2, 3]}
+        Accepts a POST request with a list of log IDs and optional format in the request body.
+        Example: {"ids": [1, 2, 3], "format": "csv_omni"}
+        Formats: "mcap" (default, original files), "csv_omni", "csv_tvn"
         """
         serializer = DownloadRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         log_ids = serializer.validated_data['ids']
+        output_format = serializer.validated_data.get('format', 'mcap')
         
         # Get the McapLog objects
         mcap_logs = McapLog.objects.filter(id__in=log_ids)
@@ -466,6 +378,145 @@ class McapLogViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Handle CSV conversion
+        if output_format.startswith('csv_'):
+            return self._download_as_csv(mcap_logs, output_format)
+        
+        # Handle MCAP download (original behavior)
+        return self._download_as_mcap(mcap_logs)
+    
+    def _download_as_csv(self, mcap_logs, format):
+        """
+        Convert MCAP files to CSV and download as ZIP.
+        """
+        # Trigger conversion tasks for all files in parallel
+        conversion_tasks = []
+        for mcap_log in mcap_logs:
+            task = convert_mcap_to_csv.delay(mcap_log.id, format)
+            conversion_tasks.append((mcap_log, task))
+        
+        # Wait for all conversions to complete (with timeout)
+        import time
+        max_wait_time = 300  # 5 minutes max wait
+        start_time = time.time()
+        
+        conversion_results = {}
+        conversion_errors = []
+        
+        for mcap_log, task in conversion_tasks:
+            try:
+                # Wait for task with timeout
+                elapsed = time.time() - start_time
+                remaining_time = max(0, max_wait_time - elapsed)
+                
+                if remaining_time <= 0:
+                    conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - conversion timeout")
+                    continue
+                
+                # Get result with timeout
+                result = task.get(timeout=remaining_time)
+                
+                if isinstance(result, str) and result.startswith("Error"):
+                    conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - {result}")
+                else:
+                    conversion_results[mcap_log] = result
+                    
+            except Exception as e:
+                conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - conversion error: {str(e)}")
+        
+        if not conversion_results:
+            return Response(
+                {
+                    'error': 'No files could be converted',
+                    'conversion_errors': conversion_errors
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Create ZIP file with converted CSV files
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_file_path = temp_file.name
+        temp_file.close()
+        
+        files_added = 0
+        files_missing = []
+        
+        try:
+            with zipfile.ZipFile(temp_file_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for mcap_log, csv_relative_path in conversion_results.items():
+                    try:
+                        csv_path = Path(settings.MEDIA_ROOT) / csv_relative_path
+                        
+                        if not csv_path.exists():
+                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - converted CSV not found at {csv_path}")
+                            continue
+                        
+                        # Generate CSV filename
+                        base_name = Path(mcap_log.file_name).stem
+                        csv_filename = f"{base_name}_{format.replace('csv_', '')}.csv"
+                        
+                        zip_file.write(str(csv_path), arcname=csv_filename)
+                        files_added += 1
+                    except Exception as file_error:
+                        files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - error: {str(file_error)}")
+                        continue
+            
+            if files_added == 0:
+                os.unlink(temp_file_path)
+                return Response(
+                    {
+                        'error': 'No converted files could be added to ZIP',
+                        'missing_files': files_missing,
+                        'conversion_errors': conversion_errors
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Generate download filename
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            zip_filename = f'mcap_logs_{format}_{timestamp}.zip'
+            
+            # Read ZIP content
+            with open(temp_file_path, 'rb') as zip_file:
+                zip_content = zip_file.read()
+            
+            os.unlink(temp_file_path)
+            
+            # Create response
+            response = HttpResponse(zip_content, content_type='application/zip')
+            response['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
+            response['Content-Length'] = len(zip_content)
+            
+            if files_missing or conversion_errors:
+                error_info = []
+                if files_missing:
+                    error_info.extend(files_missing)
+                if conversion_errors:
+                    error_info.extend(conversion_errors)
+                response['X-Missing-Files'] = ', '.join(error_info)
+            
+            return response
+            
+        except Exception as e:
+            if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+            
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"CSV download error: {str(e)}\n{error_details}")
+            
+            return Response(
+                {'error': f'Failed to create CSV ZIP archive: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _download_as_mcap(self, mcap_logs):
+        """
+        Download original MCAP files as ZIP (original behavior).
+        """
         # Create a temporary file for the ZIP
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
         temp_file_path = temp_file.name
@@ -568,27 +619,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    @swagger_auto_schema(
-        method='get',
-        operation_description="Get the parsing job status for a specific MCAP log.",
-        responses={
-            200: openapi.Response(
-                description="Job status information",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'log_id': openapi.Schema(type=openapi.TYPE_INTEGER),
-                        'parse_status': openapi.Schema(type=openapi.TYPE_STRING, description="pending, processing, completed, or error"),
-                        'parse_task_id': openapi.Schema(type=openapi.TYPE_STRING, description="Celery task ID"),
-                        'task_state': openapi.Schema(type=openapi.TYPE_STRING, description="Celery task state: PENDING, STARTED, SUCCESS, FAILURE, RETRY"),
-                        'task_info': openapi.Schema(type=openapi.TYPE_OBJECT, description="Additional task information"),
-                    }
-                )
-            ),
-            404: openapi.Response(description="Log not found"),
-        },
-        tags=['MCAP Logs']
-    )
     @action(detail=True, methods=['get'], url_path='job-status')
     def job_status(self, request, pk=None):
         """
@@ -629,37 +659,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
         
         return Response(response_data, status=status.HTTP_200_OK)
     
-    @swagger_auto_schema(
-        method='post',
-        operation_description="Upload multiple MCAP files at once. Each file will be processed in the background.",
-        manual_parameters=[
-            openapi.Parameter(
-                'files',
-                openapi.IN_FORM,
-                description="Multiple MCAP files to upload",
-                type=openapi.TYPE_ARRAY,
-                items=openapi.Items(type=openapi.TYPE_FILE),
-                required=True,
-            ),
-        ],
-        responses={
-            200: openapi.Response(
-                description="List of created MCAP log records with their job statuses",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
-                        'results': openapi.Schema(
-                            type=openapi.TYPE_ARRAY,
-                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
-                        ),
-                    }
-                )
-            ),
-            400: openapi.Response(description="No files provided"),
-        },
-        tags=['MCAP Logs']
-    )
     @action(detail=False, methods=['post'], url_path='batch-upload')
     def batch_upload(self, request):
         """
@@ -728,35 +727,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
             'results': results
         }, status=status.HTTP_201_CREATED)
     
-    @swagger_auto_schema(
-        method='get',
-        operation_description="Get parsing job statuses for all MCAP logs. Optionally filter by status.",
-        manual_parameters=[
-            openapi.Parameter(
-                'status',
-                openapi.IN_QUERY,
-                description="Filter by parse status (pending, processing, completed, or error:*)",
-                type=openapi.TYPE_STRING,
-                required=False,
-            ),
-        ],
-        responses={
-            200: openapi.Response(
-                description="List of job statuses",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
-                        'results': openapi.Schema(
-                            type=openapi.TYPE_ARRAY,
-                            items=openapi.Schema(type=openapi.TYPE_OBJECT)
-                        ),
-                    }
-                )
-            ),
-        },
-        tags=['MCAP Logs']
-    )
     @action(detail=False, methods=['get'], url_path='job-statuses')
     def job_statuses(self, request):
         """
@@ -823,28 +793,6 @@ class McapLogViewSet(viewsets.ModelViewSet):
 
 
 class ParseSummaryView(APIView):
-    @swagger_auto_schema(
-        request_body=ParseSummaryRequestSerializer,
-        operation_description="Parse MCAP file summary without creating a database record. Returns channel information, timestamps, and duration.",
-        responses={
-            200: openapi.Response(
-                description="Parsed MCAP file summary",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'channels': openapi.Schema(type=openapi.TYPE_ARRAY, items=openapi.Schema(type=openapi.TYPE_STRING)),
-                        'channel_count': openapi.Schema(type=openapi.TYPE_INTEGER),
-                        'start_time': openapi.Schema(type=openapi.TYPE_NUMBER),
-                        'end_time': openapi.Schema(type=openapi.TYPE_NUMBER),
-                        'duration': openapi.Schema(type=openapi.TYPE_NUMBER),
-                        'formatted_date': openapi.Schema(type=openapi.TYPE_STRING),
-                    }
-                )
-            ),
-            400: openapi.Response(description="Invalid request data"),
-        },
-        tags=['Parsing']
-    )
     def post(self, request):
         """
         Parse MCAP file summary without creating a database record.
