@@ -12,12 +12,38 @@ from api.views import (
 from drf_yasg.views import get_schema_view
 from drf_yasg import openapi
 
+# ===== ROUTER CONFIGURATION =====
+# DefaultRouter automatically creates URLs for ViewSet methods:
+# - Standard CRUD: list, create, retrieve, update, partial_update, destroy
+# - Custom actions: methods decorated with @action
 router = DefaultRouter()
+
+# McapLogViewSet endpoints:
+# - GET/POST /api/mcap-logs/ (list, create)
+# - GET/PUT/PATCH/DELETE /api/mcap-logs/{id}/ (retrieve, update, partial_update, destroy)
+# - GET /api/mcap-logs/{id}/geojson/ (custom action)
+# - GET /api/mcap-logs/{id}/job-status/ (custom action)
+# - POST /api/mcap-logs/download/ (custom action)
+# - POST /api/mcap-logs/batch-upload/ (custom action)
+# - GET /api/mcap-logs/job-statuses/ (custom action)
 router.register(r'mcap-logs', McapLogViewSet)
+
+# CarViewSet endpoints (read-only):
+# - GET /api/cars/ (list)
+# - GET /api/cars/{id}/ (retrieve)
 router.register(r'cars', CarViewSet, basename='car')
+
+# DriverViewSet endpoints (read-only):
+# - GET /api/drivers/ (list)
+# - GET /api/drivers/{id}/ (retrieve)
 router.register(r'drivers', DriverViewSet, basename='driver')
+
+# EventTypeViewSet endpoints (read-only):
+# - GET /api/event-types/ (list)
+# - GET /api/event-types/{id}/ (retrieve)
 router.register(r'event-types', EventTypeViewSet, basename='event-type')
 
+# ===== API DOCUMENTATION =====
 # Swagger/OpenAPI schema view
 schema_view = get_schema_view(
     openapi.Info(
@@ -31,17 +57,18 @@ schema_view = get_schema_view(
     public=True,
 )
 
+# ===== URL PATTERNS =====
 urlpatterns = [
-    # API documentation
+    # API documentation endpoints
     re_path(r'^swagger(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0), name='schema-json'),
     re_path(r'^swagger/$', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
     re_path(r'^redoc/$', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
     
-    # API routes with /api/ prefix
+    # API routes with /api/ prefix (recommended)
     path('api/', include(router.urls)),
     path("api/parse/summary/", ParseSummaryView.as_view(), name="parse-summary"),
     
-    # Also include at root for backward compatibility
+    # Root-level routes (for backward compatibility)
     path('', include(router.urls)),
     path("parse/summary/", ParseSummaryView.as_view(), name="parse-summary-root"),
 ]

@@ -41,6 +41,3 @@ class McapLog(models.Model):
     car = models.ForeignKey(Car, null=True, blank=True, on_delete=models.SET_NULL)
     driver = models.ForeignKey(Driver, null=True, blank=True, on_delete=models.SET_NULL)
     event_type = models.ForeignKey(EventType, null=True, blank=True, on_delete=models.SET_NULL)
-
-
-    print("test")
