@@ -2,6 +2,14 @@
 
 A Django REST Framework backend for managing and parsing **Formula SAE telemetry logs** recorded in the `.mcap` format.
 
+## Monorepo layout
+- `backend/` — Django + Celery API (PostGIS/Redis)
+- `frontend/` — Next.js client (npm)
+
+### Quick start
+- Backend: `cd backend && uv run python manage.py runserver`
+- Frontend: `cd frontend && npm install && npm run dev`
+
 The service automates:
 - Getting MCAP log files from the car’s onboard Pi
 - Running `mcap recover` on every uploaded file

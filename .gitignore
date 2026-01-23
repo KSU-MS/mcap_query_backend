@@ -13,3 +13,13 @@ wheels/
 backend/media/
 media/
 *.mcap
+
+# Frontend (Next.js) artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.turbo/
+frontend/.vercel/
+frontend/npm-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*

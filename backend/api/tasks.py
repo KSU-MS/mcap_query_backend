@@ -79,14 +79,14 @@ def parse_mcap_file(self, mcap_log_id, file_path):
 @shared_task(bind=True, max_retries=3)
 def convert_mcap_to_csv(self, mcap_log_id, format='omni'):
     """
-    Background task to convert an MCAP file to CSV format.
+    Background task to convert an MCAP file to CSV/LD format.
     
     Args:
         mcap_log_id: The ID of the McapLog record to convert
-        format: CSV format profile ('omni' or 'tvn')
+        format: Format profile ('omni', 'tvn', or 'ld')
         
     Returns:
-        Path to the converted CSV file
+        Path to the converted file
     """
     try:
         mcap_log = McapLog.objects.get(id=mcap_log_id)
@@ -127,10 +127,12 @@ def convert_mcap_to_csv(self, mcap_log_id, format='omni'):
         # Generate output filename
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         format_suffix = format.replace('csv_', '') if format.startswith('csv_') else format
-        output_filename = f"{mcap_log_id}_{format_suffix}_{timestamp}.csv"
+        # Use appropriate file extension based on format
+        file_extension = 'ld' if format_suffix == 'ld' else 'csv'
+        output_filename = f"{mcap_log_id}_{format_suffix}_{timestamp}.{file_extension}"
         output_path = converted_dir / output_filename
         
-        # Convert MCAP to CSV
+        # Convert MCAP to CSV/LD
         converter = McapToCsvConverter()
         converter.convert_to_csv(str(file_path), str(output_path), format=format_suffix)
         
@@ -145,5 +147,5 @@ def convert_mcap_to_csv(self, mcap_log_id, format='omni'):
         if self.request.retries < self.max_retries:
             raise self.retry(exc=e, countdown=60 * (self.request.retries + 1))
         
-        return f"Error converting MCAP file to CSV: {str(e)}"
+        return f"Error converting MCAP file to {format}: {str(e)}"
 

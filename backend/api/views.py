@@ -14,8 +14,7 @@ from .serializers import (
 )
 from .parser import Parser
 from .gpsparse import GpsParser
-from .tasks import parse_mcap_file, convert_mcap_to_csv
-from celery.result import AsyncResult
+from .tasks import parse_mcap_file
 import os
 import datetime
 import zipfile
@@ -350,7 +349,7 @@ class McapLogViewSet(viewsets.ModelViewSet):
         Download selected MCAP log files as a ZIP archive.
         Accepts a POST request with a list of log IDs and optional format in the request body.
         Example: {"ids": [1, 2, 3], "format": "csv_omni"}
-        Formats: "mcap" (default, original files), "csv_omni", "csv_tvn"
+        Formats: "mcap" (default, original files), "csv_omni", "csv_tvn", "ld"
         """
         serializer = DownloadRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -378,49 +377,77 @@ class McapLogViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Handle CSV conversion
-        if output_format.startswith('csv_'):
-            return self._download_as_csv(mcap_logs, output_format)
+        # Handle CSV/LD conversion
+        if output_format.startswith('csv_') or output_format == 'ld':
+            return self._download_as_converted(mcap_logs, output_format)
         
         # Handle MCAP download (original behavior)
         return self._download_as_mcap(mcap_logs)
     
-    def _download_as_csv(self, mcap_logs, format):
+    def _download_as_converted(self, mcap_logs, format):
         """
-        Convert MCAP files to CSV and download as ZIP.
+        Convert MCAP files to CSV/LD and download as ZIP.
+        Uses synchronous conversion (can be switched to async Celery if needed).
         """
-        # Trigger conversion tasks for all files in parallel
-        conversion_tasks = []
-        for mcap_log in mcap_logs:
-            task = convert_mcap_to_csv.delay(mcap_log.id, format)
-            conversion_tasks.append((mcap_log, task))
-        
-        # Wait for all conversions to complete (with timeout)
-        import time
-        max_wait_time = 300  # 5 minutes max wait
-        start_time = time.time()
+        from .mcap_converter import McapToCsvConverter
+        from django.conf import settings
+        import datetime
         
         conversion_results = {}
         conversion_errors = []
         
-        for mcap_log, task in conversion_tasks:
+        # Process conversions synchronously
+        for mcap_log in mcap_logs:
             try:
-                # Wait for task with timeout
-                elapsed = time.time() - start_time
-                remaining_time = max(0, max_wait_time - elapsed)
+                # Determine source file path
+                file_path = None
                 
-                if remaining_time <= 0:
-                    conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - conversion timeout")
+                # Try recovered_uri first if available and not pending
+                if mcap_log.recovered_uri and mcap_log.recovered_uri != "pending":
+                    if mcap_log.recovered_uri.startswith(settings.MEDIA_URL):
+                        file_name = mcap_log.recovered_uri.replace(settings.MEDIA_URL, '', 1)
+                        file_path = Path(settings.MEDIA_ROOT) / file_name
+                    elif mcap_log.recovered_uri.startswith('/'):
+                        file_path = Path(mcap_log.recovered_uri)
+                    else:
+                        file_path = Path(settings.MEDIA_ROOT) / mcap_log.recovered_uri
+                
+                # Fall back to original_uri if recovered_uri not available
+                if not file_path or not file_path.exists():
+                    if mcap_log.original_uri:
+                        if mcap_log.original_uri.startswith(settings.MEDIA_URL):
+                            file_name = mcap_log.original_uri.replace(settings.MEDIA_URL, '', 1)
+                            file_path = Path(settings.MEDIA_ROOT) / file_name
+                        elif mcap_log.original_uri.startswith('/'):
+                            file_path = Path(mcap_log.original_uri)
+                        else:
+                            file_path = Path(settings.MEDIA_ROOT) / mcap_log.original_uri
+                
+                if not file_path or not file_path.exists():
+                    conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - MCAP file not found")
                     continue
                 
-                # Get result with timeout
-                result = task.get(timeout=remaining_time)
+                file_path = file_path.resolve()
                 
-                if isinstance(result, str) and result.startswith("Error"):
-                    conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - {result}")
-                else:
-                    conversion_results[mcap_log] = result
-                    
+                # Create output directory for converted files
+                converted_dir = Path(settings.MEDIA_ROOT) / 'converted'
+                converted_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate output filename
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                format_suffix = format.replace('csv_', '') if format.startswith('csv_') else format
+                file_extension = 'ld' if format_suffix == 'ld' else 'csv'
+                output_filename = f"{mcap_log.id}_{format_suffix}_{timestamp}.{file_extension}"
+                output_path = converted_dir / output_filename
+                
+                # Convert MCAP to CSV/LD synchronously
+                converter = McapToCsvConverter()
+                converter.convert_to_csv(str(file_path), str(output_path), format=format_suffix)
+                
+                # Return the path relative to MEDIA_ROOT
+                relative_path = output_path.relative_to(settings.MEDIA_ROOT)
+                conversion_results[mcap_log] = str(relative_path)
+                
             except Exception as e:
                 conversion_errors.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - conversion error: {str(e)}")
         
@@ -443,19 +470,21 @@ class McapLogViewSet(viewsets.ModelViewSet):
         
         try:
             with zipfile.ZipFile(temp_file_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                for mcap_log, csv_relative_path in conversion_results.items():
+                for mcap_log, converted_relative_path in conversion_results.items():
                     try:
-                        csv_path = Path(settings.MEDIA_ROOT) / csv_relative_path
+                        converted_path = Path(settings.MEDIA_ROOT) / converted_relative_path
                         
-                        if not csv_path.exists():
-                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - converted CSV not found at {csv_path}")
+                        if not converted_path.exists():
+                            files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - converted file not found at {converted_path}")
                             continue
                         
-                        # Generate CSV filename
+                        # Generate output filename based on format
                         base_name = Path(mcap_log.file_name).stem
-                        csv_filename = f"{base_name}_{format.replace('csv_', '')}.csv"
+                        format_suffix = format.replace('csv_', '') if format.startswith('csv_') else format
+                        file_extension = 'ld' if format_suffix == 'ld' else 'csv'
+                        output_filename = f"{base_name}_{format_suffix}.{file_extension}"
                         
-                        zip_file.write(str(csv_path), arcname=csv_filename)
+                        zip_file.write(str(converted_path), arcname=output_filename)
                         files_added += 1
                     except Exception as file_error:
                         files_missing.append(f"{mcap_log.file_name} (ID: {mcap_log.id}) - error: {str(file_error)}")
@@ -474,7 +503,8 @@ class McapLogViewSet(viewsets.ModelViewSet):
             
             # Generate download filename
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            zip_filename = f'mcap_logs_{format}_{timestamp}.zip'
+            format_display = format.replace('csv_', '') if format.startswith('csv_') else format
+            zip_filename = f'mcap_logs_{format_display}_{timestamp}.zip'
             
             # Read ZIP content
             with open(temp_file_path, 'rb') as zip_file:
@@ -509,7 +539,7 @@ class McapLogViewSet(viewsets.ModelViewSet):
             print(f"CSV download error: {str(e)}\n{error_details}")
             
             return Response(
-                {'error': f'Failed to create CSV ZIP archive: {str(e)}'},
+                {'error': f'Failed to create {format.upper()} ZIP archive: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
