@@ -47,7 +47,12 @@ SECRET_KEY = 'django-insecure-p^(ga6^d1p2c#(&@hl5pz0#$7by@0n8jy9nka(md%o)qrg_80h
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+_allowed_hosts_env = os.environ.get("ALLOWED_HOSTS", "").strip()
+if _allowed_hosts_env:
+    ALLOWED_HOSTS = [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
+else:
+    # Dev-friendly defaults (Docker + local)
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1", "0.0.0.0"]
 
 
 # Application definition
@@ -100,14 +105,21 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
+POSTGRES_DB = os.environ.get('POSTGRES_DB', 'mcap_query_db')
+POSTGRES_USER = os.environ.get('POSTGRES_USER', 'postgres')
+POSTGRES_PASSWORD = os.environ.get('POSTGRES_PASSWORD', 'postgres')
+# For local dev we map Postgres to localhost:5433; for Docker use service name "db" on 5432.
+POSTGRES_HOST = os.environ.get('POSTGRES_HOST', 'localhost')
+POSTGRES_PORT = os.environ.get('POSTGRES_PORT', '5433')
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.contrib.gis.db.backends.postgis',
-        'NAME': 'mcap_query_db',
-        'USER': 'postgres',
-        'PASSWORD': 'postgres',
-        'HOST': 'localhost',
-        'PORT': '5433',
+        'NAME': POSTGRES_DB,
+        'USER': POSTGRES_USER,
+        'PASSWORD': POSTGRES_PASSWORD,
+        'HOST': POSTGRES_HOST,
+        'PORT': POSTGRES_PORT,
     }
 }
 
@@ -150,7 +162,7 @@ STATIC_URL = 'static/'
 
 # Media files (User uploads)
 MEDIA_URL = '/media/'
-MEDIA_ROOT = Path('/Users/pettruskonnoth/Documents')
+MEDIA_ROOT = Path(os.environ.get('MEDIA_ROOT', '/Users/pettruskonnoth/Documents'))
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

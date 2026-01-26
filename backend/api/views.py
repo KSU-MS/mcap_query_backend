@@ -14,7 +14,7 @@ from .serializers import (
 )
 from .parser import Parser
 from .gpsparse import GpsParser
-from .tasks import parse_mcap_file
+from .tasks import parse_mcap_file, recover_mcap_file
 import os
 import datetime
 import zipfile
@@ -25,6 +25,7 @@ from django.utils import timezone
 from django.contrib.gis.geos import LineString, Point, Polygon
 from django.conf import settings
 from django.db.models import Q
+from celery.result import AsyncResult
 
 class McapLogViewSet(viewsets.ModelViewSet):
     queryset = McapLog.objects.all()
@@ -174,7 +175,7 @@ class McapLogViewSet(viewsets.ModelViewSet):
         
         # Handle file upload
         uploaded_file = request.FILES.get('file')
-        saved_file_path = None
+        saved_file_relpath = None
         
         if uploaded_file:
             # Create media directory if it doesn't exist
@@ -191,7 +192,8 @@ class McapLogViewSet(viewsets.ModelViewSet):
                 for chunk in uploaded_file.chunks():
                     destination.write(chunk)
             
-            saved_file_path = str(file_path)
+            # Store relative path so Celery workers (possibly in Docker) can resolve via MEDIA_ROOT
+            saved_file_relpath = str(file_path.relative_to(settings.MEDIA_ROOT))
             
             # Calculate and store file size
             file_size = file_path.stat().st_size
@@ -218,11 +220,12 @@ class McapLogViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         mcap_log_instance = serializer.instance
         
-        # If a file was uploaded, trigger background parsing
-        if saved_file_path:
-            task = parse_mcap_file.delay(mcap_log_instance.id, saved_file_path)
-            # Store the task ID for status tracking
-            mcap_log_instance.parse_task_id = task.id
+        # If a file was uploaded, trigger recovery (which will trigger parsing when done)
+        if saved_file_relpath:
+            # Recovery task will trigger parsing automatically when it completes
+            recovery_task = recover_mcap_file.delay(mcap_log_instance.id, saved_file_relpath)
+            # Store the recovery task ID for status tracking
+            mcap_log_instance.parse_task_id = recovery_task.id
             mcap_log_instance.save(update_fields=['parse_task_id'])
         
         headers = self.get_success_headers(serializer.data)
@@ -721,7 +724,7 @@ class McapLogViewSet(viewsets.ModelViewSet):
                     for chunk in uploaded_file.chunks():
                         destination.write(chunk)
                 
-                saved_file_path = str(file_path)
+                saved_file_relpath = str(file_path.relative_to(settings.MEDIA_ROOT))
                 
                 # Calculate file size
                 file_size = file_path.stat().st_size
@@ -735,9 +738,9 @@ class McapLogViewSet(viewsets.ModelViewSet):
                     recovery_status="pending",
                 )
                 
-                # Trigger background parsing job
-                task = parse_mcap_file.delay(mcap_log.id, saved_file_path)
-                mcap_log.parse_task_id = task.id
+                # Trigger recovery (which will trigger parsing when done)
+                recovery_task = recover_mcap_file.delay(mcap_log.id, saved_file_relpath)
+                mcap_log.parse_task_id = recovery_task.id
                 mcap_log.save(update_fields=['parse_task_id'])
                 
                 # Serialize the result

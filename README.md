@@ -7,7 +7,8 @@ A Django REST Framework backend for managing and parsing **Formula SAE telemetry
 - `frontend/` — Next.js client (npm)
 
 ### Quick start
-- Backend: `cd backend && uv run python manage.py runserver`
+- Backend (local): `./scripts/dev_backend_local.sh`
+- Celery worker (local, optional): `./scripts/dev_celery_local.sh`
 - Frontend: `cd frontend && npm install && npm run dev`
 
 The service automates:

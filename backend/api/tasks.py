@@ -7,10 +7,126 @@ from django.utils import timezone
 from django.conf import settings
 from pathlib import Path
 import datetime
+import subprocess
+import shutil
 from .models import McapLog
 from .parser import Parser
 from .gpsparse import GpsParser
 from .mcap_converter import McapToCsvConverter
+
+
+@shared_task(bind=True, max_retries=3)
+def recover_mcap_file(self, mcap_log_id, file_path):
+    """
+    Background task to recover an MCAP file using 'mcap recover' command.
+    
+    Args:
+        mcap_log_id: The ID of the McapLog record to update
+        file_path: Relative path (preferred) or absolute path to the MCAP file to recover
+    """
+    try:
+        mcap_log = McapLog.objects.get(id=mcap_log_id)
+
+        # Resolve relative paths against MEDIA_ROOT to support Dockerized workers
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = (Path(settings.MEDIA_ROOT) / p).resolve()
+        original_file_path = p
+
+        # Helpful debug
+        print(
+            f"[recover_mcap_file] mcap_log_id={mcap_log_id} "
+            f"input_file_path={original_file_path} exists={original_file_path.exists()} "
+            f"MEDIA_ROOT={settings.MEDIA_ROOT}"
+        )
+        
+        if not original_file_path.exists():
+            raise FileNotFoundError(f"MCAP file not found: {original_file_path}")
+        
+        # Update recovery status to processing
+        mcap_log.recovery_status = "processing"
+        mcap_log.save(update_fields=['recovery_status'])
+        
+        # Find mcap command
+        mcap_cmd = shutil.which('mcap')
+        if not mcap_cmd:
+            raise RuntimeError("mcap command not found in PATH. Please install mcap CLI.")
+        
+        # Create recovered directory inside mcap_logs folder
+        recovered_dir = Path(settings.MEDIA_ROOT) / 'mcap_logs' / 'recovered'
+        recovered_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create recovered file path with descriptive naming (original filename + recovery suffix)
+        recovered_file_name = f"{original_file_path.stem}-recovered{original_file_path.suffix}"
+        recovered_file_path = recovered_dir / recovered_file_name
+        
+        # Run mcap recover command with -o flag
+        # mcap recover input.mcap -o output.mcap
+        result = subprocess.run(
+            [mcap_cmd, 'recover', str(original_file_path), '-o', str(recovered_file_path)],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            raise RuntimeError(f"mcap recover failed: {error_msg}")
+        
+        # Check if recovered file was created
+        if not recovered_file_path.exists():
+            raise FileNotFoundError(f"Recovered file was not created: {recovered_file_path}")
+        
+        # Log recovery statistics from stdout or stderr (e.g., "Recovered 3728056 messages, 0 attachments, and 0 metadata records.")
+        # The mcap CLI may output to either stdout or stderr
+        recovery_output = ""
+        if result.stdout and result.stdout.strip():
+            recovery_output = result.stdout.strip()
+        elif result.stderr and result.stderr.strip():
+            # Sometimes output goes to stderr even on success
+            recovery_output = result.stderr.strip()
+        
+        if recovery_output:
+            print(f"[recover_mcap_file] Recovery statistics: {recovery_output}")
+        
+        # Store the recovered file URI (relative to MEDIA_ROOT)
+        recovered_relpath = recovered_file_path.relative_to(settings.MEDIA_ROOT)
+        mcap_log.recovered_uri = f"{settings.MEDIA_URL}{recovered_relpath.as_posix()}"
+        mcap_log.recovery_status = "completed"
+        mcap_log.save(update_fields=['recovered_uri', 'recovery_status'])
+        
+        print(f"[recover_mcap_file] Successfully recovered MCAP file: {recovered_file_path}")
+        
+        # Trigger parsing after recovery completes
+        # Use the original file_path (relative) - parse will use recovered file if available
+        parse_mcap_file.delay(mcap_log_id, file_path)
+        
+        return mcap_log_id  # Return ID for potential chaining
+        
+    except McapLog.DoesNotExist:
+        return f"McapLog with id {mcap_log_id} does not exist"
+    except subprocess.TimeoutExpired:
+        try:
+            mcap_log = McapLog.objects.get(id=mcap_log_id)
+            mcap_log.recovery_status = "error: timeout after 5 minutes"
+            mcap_log.save(update_fields=['recovery_status'])
+        except:
+            pass
+        return f"Recovery timed out for log {mcap_log_id}"
+    except Exception as e:
+        # Update recovery status with error
+        try:
+            mcap_log = McapLog.objects.get(id=mcap_log_id)
+            mcap_log.recovery_status = f"error: {str(e)}"
+            mcap_log.save(update_fields=['recovery_status'])
+        except:
+            pass
+        
+        # Retry the task if it's a retryable error
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e, countdown=60 * (self.request.retries + 1))
+        
+        return f"Error recovering MCAP file: {str(e)}"
 
 
 @shared_task(bind=True, max_retries=3)
@@ -20,17 +136,54 @@ def parse_mcap_file(self, mcap_log_id, file_path):
     
     Args:
         mcap_log_id: The ID of the McapLog record to update
-        file_path: Path to the MCAP file to parse
+        file_path: Relative path (preferred) or absolute path to the MCAP file to parse
     """
     try:
         mcap_log = McapLog.objects.get(id=mcap_log_id)
+
+        # Resolve relative paths against MEDIA_ROOT to support Dockerized workers
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = (Path(settings.MEDIA_ROOT) / p).resolve()
+        original_file_path = p
+
+        # Try to use recovered file if available, otherwise use original
+        file_to_parse = None
+        if mcap_log.recovered_uri and mcap_log.recovered_uri != "pending":
+            # Extract path from recovered_uri
+            if mcap_log.recovered_uri.startswith(settings.MEDIA_URL):
+                file_name = mcap_log.recovered_uri.replace(settings.MEDIA_URL, '', 1)
+                recovered_path = Path(settings.MEDIA_ROOT) / file_name
+            elif mcap_log.recovered_uri.startswith('/'):
+                recovered_path = Path(mcap_log.recovered_uri)
+            else:
+                recovered_path = Path(settings.MEDIA_ROOT) / mcap_log.recovered_uri
+            
+            if recovered_path.exists():
+                file_to_parse = str(recovered_path)
+                print(f"[parse_mcap_file] Using recovered file: {file_to_parse}")
+        
+        # Fall back to original file if recovered file not available
+        if not file_to_parse:
+            file_to_parse = str(original_file_path)
+            print(f"[parse_mcap_file] Using original file: {file_to_parse}")
+
+        # Helpful debug for Docker issues (shows exactly what path Celery is trying to read)
+        print(
+            f"[parse_mcap_file] mcap_log_id={mcap_log_id} "
+            f"input_file_path={file_to_parse} exists={Path(file_to_parse).exists()} "
+            f"MEDIA_ROOT={settings.MEDIA_ROOT}"
+        )
+        
+        if not Path(file_to_parse).exists():
+            raise FileNotFoundError(f"MCAP file not found for parsing: {file_to_parse}")
         
         # Update parse status to processing
         mcap_log.parse_status = "processing"
         mcap_log.save(update_fields=['parse_status'])
         
         # Parse the MCAP file
-        parsed_data = Parser.parse_stuff(file_path)
+        parsed_data = Parser.parse_stuff(file_to_parse)
         
         # Update fields from parsed data
         mcap_log.channels = parsed_data.get("channels", [])
@@ -40,7 +193,7 @@ def parse_mcap_file(self, mcap_log_id, file_path):
         mcap_log.duration_seconds = parsed_data.get("duration", 0)
         
         # Parse GPS coordinates from the file
-        gps_data = GpsParser.parse_gps(file_path)
+        gps_data = GpsParser.parse_gps(file_to_parse)
         all_coordinates = gps_data.get("all_coordinates", [])
         
         # Create LineString from all GPS coordinates for map preview

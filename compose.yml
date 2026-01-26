@@ -18,23 +18,97 @@ services:
       timeout: 5s
       retries: 5
 
-  # Redis is already running on port 6379 (container: redis-queue)
-  # Using existing Redis instance instead of creating a new one
-  # If you need a separate Redis, uncomment below and change port to 6380
-  # redis:
-  #   image: redis:7-alpine
-  #   restart: always
-  #   ports:
-  #     - "6380:6379"
-  #   volumes:
-  #     - redis_data:/data
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  celery:
+    image: python:3.13-slim
+    working_dir: /app/backend
+    command: >
+      sh -c "
+        apt-get update &&
+        apt-get install -y --no-install-recommends gdal-bin libgdal-dev g++ postgresql-client libpq-dev &&
+        rm -rf /var/lib/apt/lists/* &&
+        GDAL_LIB=$$(ldconfig -p 2>/dev/null | awk '/libgdal\\.so/ {print $$NF}' | grep -v '/ogdi/' | head -1) &&
+        GEOS_LIB=$$(ldconfig -p 2>/dev/null | awk '/libgeos_c\.so/ {print $$NF; exit}') &&
+        [ -n \"$$GDAL_LIB\" ] && export GDAL_LIBRARY_PATH=$$GDAL_LIB &&
+        [ -n \"$$GEOS_LIB\" ] && export GEOS_LIBRARY_PATH=$$GEOS_LIB &&
+        pip install --no-cache-dir uv &&
+        cd /app && uv sync &&
+        cd /app/backend && uv run celery -A backend worker --loglevel=info
+      "
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=backend.settings
+      - POSTGRES_DB=mcap_query_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - MEDIA_ROOT=/app/media
+      - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  backend:
+    image: python:3.13-slim
+    working_dir: /app/backend
+    command: >
+      sh -c "
+        apt-get update &&
+        apt-get install -y --no-install-recommends gdal-bin libgdal-dev g++ postgresql-client libpq-dev &&
+        rm -rf /var/lib/apt/lists/* &&
+        GDAL_LIB=$$(ldconfig -p 2>/dev/null | awk '/libgdal\\.so/ {print $$NF}' | grep -v '/ogdi/' | head -1) &&
+        GEOS_LIB=$$(ldconfig -p 2>/dev/null | awk '/libgeos_c\\.so/ {print $$NF}' | head -1) &&
+        [ -n \"$$GDAL_LIB\" ] && export GDAL_LIBRARY_PATH=$$GDAL_LIB &&
+        [ -n \"$$GEOS_LIB\" ] && export GEOS_LIBRARY_PATH=$$GEOS_LIB &&
+        pip install --no-cache-dir uv &&
+        cd /app && uv sync &&
+        cd /app/backend &&
+        uv run python manage.py migrate &&
+        uv run python manage.py runserver 0.0.0.0:8000
+      "
+    volumes:
+      - .:/app
+      - media_data:/app/media
+    environment:
+      - DJANGO_SETTINGS_MODULE=backend.settings
+      - POSTGRES_DB=mcap_query_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - MEDIA_ROOT=/app/media
+      - ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
-  # redis_data:  # Uncomment if using separate Redis
+  redis_data:
+  media_data:
 
