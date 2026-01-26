@@ -382,7 +382,9 @@ export default function Home() {
         const carsResponse = await fetch(`${API_BASE_URL}/cars/`);
         if (carsResponse.ok) {
           const carsData = await carsResponse.json();
-          setCars(Array.isArray(carsData) ? carsData : []);
+          // Handle paginated response (DRF returns {results: [...]}) or direct array
+          const carsArray = Array.isArray(carsData) ? carsData : (carsData.results || []);
+          setCars(carsArray);
         }
       } catch (err) {
         console.warn('Failed to fetch cars:', err);
@@ -393,7 +395,9 @@ export default function Home() {
         const driversResponse = await fetch(`${API_BASE_URL}/drivers/`);
         if (driversResponse.ok) {
           const driversData = await driversResponse.json();
-          setDrivers(Array.isArray(driversData) ? driversData : []);
+          // Handle paginated response (DRF returns {results: [...]}) or direct array
+          const driversArray = Array.isArray(driversData) ? driversData : (driversData.results || []);
+          setDrivers(driversArray);
         }
       } catch (err) {
         console.warn('Failed to fetch drivers:', err);
@@ -404,7 +408,9 @@ export default function Home() {
         const eventTypesResponse = await fetch(`${API_BASE_URL}/event-types/`);
         if (eventTypesResponse.ok) {
           const eventTypesData = await eventTypesResponse.json();
-          setEventTypes(Array.isArray(eventTypesData) ? eventTypesData : []);
+          // Handle paginated response (DRF returns {results: [...]}) or direct array
+          const eventTypesArray = Array.isArray(eventTypesData) ? eventTypesData : (eventTypesData.results || []);
+          setEventTypes(eventTypesArray);
         }
       } catch (err) {
         console.warn('Failed to fetch event types:', err);
@@ -1040,7 +1046,8 @@ export default function Home() {
                     </th>
                     <th>ID</th>
                     <th>Map Preview</th>
-                    <th>Captured At</th>
+                    <th>Date</th>
+                    <th>Time</th>
                     <th>Duration</th>
                     <th>Channels</th>
                     <th>Status</th>
@@ -1075,7 +1082,12 @@ export default function Home() {
                       </td>
                       <td className="text-sm text-gray-700">
                         {log.captured_at
-                          ? new Date(log.captured_at).toLocaleString()
+                          ? new Date(log.captured_at).toLocaleDateString()
+                          : 'N/A'}
+                      </td>
+                      <td className="text-sm text-gray-700">
+                        {log.captured_at
+                          ? new Date(log.captured_at).toLocaleTimeString()
                           : 'N/A'}
                       </td>
                       <td className="text-sm text-gray-700">
@@ -1430,12 +1442,16 @@ export default function Home() {
                       <SelectTrigger id="car" className="bg-white border-gray-300">
                         <SelectValue placeholder="Select a car" />
                       </SelectTrigger>
-                      <SelectContent className="bg-white border border-gray-200">
-                        {cars.map((car) => (
-                          <SelectItem key={car.id} value={car.id.toString()}>
-                            {car.name}
-                          </SelectItem>
-                        ))}
+                      <SelectContent className="bg-white border border-gray-200 z-[100]">
+                        {cars.length === 0 ? (
+                          <div className="px-2 py-1.5 text-sm text-gray-500">No cars available</div>
+                        ) : (
+                          cars.map((car) => (
+                            <SelectItem key={car.id} value={car.id.toString()}>
+                              {car.name}
+                            </SelectItem>
+                          ))
+                        )}
                       </SelectContent>
                     </Select>
                   )}
@@ -1474,12 +1490,16 @@ export default function Home() {
                       <SelectTrigger id="driver" className="bg-white border-gray-300">
                         <SelectValue placeholder="Select a driver" />
                       </SelectTrigger>
-                      <SelectContent className="bg-white border border-gray-200">
-                        {drivers.map((driver) => (
-                          <SelectItem key={driver.id} value={driver.id.toString()}>
-                            {driver.name}
-                          </SelectItem>
-                        ))}
+                      <SelectContent className="bg-white border border-gray-200 z-[100]">
+                        {drivers.length === 0 ? (
+                          <div className="px-2 py-1.5 text-sm text-gray-500">No drivers available</div>
+                        ) : (
+                          drivers.map((driver) => (
+                            <SelectItem key={driver.id} value={driver.id.toString()}>
+                              {driver.name}
+                            </SelectItem>
+                          ))
+                        )}
                       </SelectContent>
                     </Select>
                   )}
@@ -1518,12 +1538,16 @@ export default function Home() {
                       <SelectTrigger id="event_type" className="bg-white border-gray-300">
                         <SelectValue placeholder="Select an event type" />
                       </SelectTrigger>
-                      <SelectContent className="bg-white border border-gray-200">
-                        {eventTypes.map((eventType) => (
-                          <SelectItem key={eventType.id} value={eventType.id.toString()}>
-                            {eventType.name}
-                          </SelectItem>
-                        ))}
+                      <SelectContent className="bg-white border border-gray-200 z-[100]">
+                        {eventTypes.length === 0 ? (
+                          <div className="px-2 py-1.5 text-sm text-gray-500">No event types available</div>
+                        ) : (
+                          eventTypes.map((eventType) => (
+                            <SelectItem key={eventType.id} value={eventType.id.toString()}>
+                              {eventType.name}
+                            </SelectItem>
+                          ))
+                        )}
                       </SelectContent>
                     </Select>
                   )}
@@ -1540,27 +1564,20 @@ export default function Home() {
                   </div>
                 <DialogFooter>
                   <Button
-                      onClick={() => handleUpdateLog(selectedLog.id, false)}
-                      disabled={saving}
-                    className="bg-green-600 hover:bg-green-700 text-white"
-                    >
-                      {saving ? 'Saving...' : 'Update (PATCH)'}
+                    onClick={() => handleUpdateLog(selectedLog.id, false)}
+                    disabled={saving}
+                    className="bg-purple-600 hover:bg-purple-700 text-white"
+                  >
+                    {saving ? 'Saving...' : 'Save'}
                   </Button>
                   <Button
-                      onClick={() => handleUpdateLog(selectedLog.id, true)}
-                      disabled={saving}
-                      className="bg-purple-600 hover:bg-purple-700 text-white"
-                    >
-                      {saving ? 'Saving...' : 'Update (PUT)'}
-                  </Button>
-                  <Button
-                      onClick={() => {
-                        setIsEditModalOpen(false);
-                        setSelectedLog(null);
-                      }}
-                      className="bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300"
-                    >
-                      Cancel
+                    onClick={() => {
+                      setIsEditModalOpen(false);
+                      setSelectedLog(null);
+                    }}
+                    className="bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300"
+                  >
+                    Cancel
                   </Button>
                 </DialogFooter>
                   </div>
