@@ -49,7 +49,7 @@ const MapPreview = dynamic(
       };
 
       return ({ logId, apiBaseUrl, onMapClick }: { logId: number; apiBaseUrl: string; onMapClick?: (logId: number) => void }) => {
-      const [geoJsonData, setGeoJsonData] = React.useState<any>(null);
+      const [geoJsonData, setGeoJsonData] = React.useState(null as any);
       const [loading, setLoading] = React.useState(true);
       const [mounted, setMounted] = React.useState(false);
       const [containerReady, setContainerReady] = React.useState(false);
@@ -343,7 +343,11 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [processingLogIds, setProcessingLogIds] = useState<number[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 10; // matches backend REST_FRAMEWORK['PAGE_SIZE']
   const [selectedLog, setSelectedLog] = useState<McapLog | null>(null);
   const [isViewModalOpen, setIsViewModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
@@ -362,6 +366,7 @@ export default function Home() {
   const [geoJsonData, setGeoJsonData] = useState<any>(null);
   const [loadingGeoJson, setLoadingGeoJson] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [downloading, setDownloading] = useState<number | null>(null);
   const [selectedLogIds, setSelectedLogIds] = useState<number[]>([]);
   const [isDownloadDialogOpen, setIsDownloadDialogOpen] = useState(false);
@@ -422,34 +427,33 @@ export default function Home() {
     }
   };
 
-  // Fetch logs from the API
-  const fetchLogs = async () => {
+  // Fetch logs from the API (paginated; server-side search)
+  const fetchLogs = async (page: number = 1, search: string = '') => {
     setLoading(true);
     setError(null);
     try {
-      const allLogs: McapLog[] = [];
-      let url: string | null = `${API_BASE_URL}/mcap-logs/`;
+      const params = new URLSearchParams();
+      params.set('page', String(page));
+      if (search.trim()) params.set('search', search.trim());
 
-      while (url) {
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`Failed to fetch logs: ${response.statusText}`);
-        }
-        const data = await response.json();
-
-        if (Array.isArray(data)) {
-          allLogs.push(...data);
-          url = null;
-        } else if (data?.results) {
-          allLogs.push(...data.results);
-          url = data.next;
-        } else {
-          // Unknown shape; stop
-          url = null;
-        }
+      const url = `${API_BASE_URL}/mcap-logs/?${params.toString()}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch logs: ${response.statusText}`);
       }
+      const data = await response.json();
 
-      setLogs(allLogs);
+      if (Array.isArray(data)) {
+        // Fallback if pagination is disabled
+        setLogs(data);
+        setTotalCount(data.length);
+      } else if (data?.results) {
+        setLogs(data.results);
+        setTotalCount(typeof data.count === 'number' ? data.count : data.results.length);
+      } else {
+        setLogs([]);
+        setTotalCount(0);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch logs');
       console.error('Error fetching logs:', err);
@@ -458,10 +462,16 @@ export default function Home() {
     }
   };
 
-  // Upload file
+  const removeSelectedFileAtIndex = (index: number) => {
+    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const clearSelectedFiles = () => setSelectedFiles([]);
+
+  // Upload file(s)
   const handleUpload = async () => {
-    if (!selectedFile) {
-      setError('Please select a file first');
+    if (selectedFiles.length === 0) {
+      setError('Please select one or more .mcap files first');
       return;
     }
 
@@ -470,9 +480,12 @@ export default function Home() {
 
     try {
       const formData = new FormData();
-      formData.append('file', selectedFile);
+      for (const file of selectedFiles) {
+        formData.append('files', file);
+      }
 
-      const response = await fetch(`${API_BASE_URL}/mcap-logs/`, {
+      // Always use batch upload endpoint (works for 1+ files)
+      const response = await fetch(`${API_BASE_URL}/mcap-logs/batch-upload/`, {
         method: 'POST',
         body: formData,
       });
@@ -484,9 +497,20 @@ export default function Home() {
         );
       }
 
-      // Clear selected file and refresh logs
-      setSelectedFile(null);
-      await fetchLogs();
+      // Capture created log IDs so we can show a simple processing indicator
+      const payload = await response.json().catch(() => null);
+      const createdIds: number[] =
+        payload?.results?.map((r: any) => r?.id).filter((id: any) => typeof id === 'number') ?? [];
+
+      if (createdIds.length > 0) {
+        setProcessingLogIds((prev) => Array.from(new Set([...prev, ...createdIds])));
+      }
+
+      // Clear selection and refresh logs (newest logs are on page 1)
+      setSelectedLogIds([]);
+      setSelectedFiles([]);
+      setCurrentPage(1);
+      await fetchLogs(1, debouncedSearchQuery);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to upload file');
       console.error('Error uploading file:', err);
@@ -495,18 +519,22 @@ export default function Home() {
     }
   };
 
-  // Handle file selection
+  // Handle file selection (multiple)
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      if (file.name.endsWith('.mcap')) {
-        setSelectedFile(file);
-        setError(null);
-      } else {
-        setError('Please select a .mcap file');
-        setSelectedFile(null);
-      }
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
+
+    const mcapFiles = files.filter((f) => f.name.toLowerCase().endsWith('.mcap'));
+    if (mcapFiles.length !== files.length) {
+      setError('Some files were ignored. Only .mcap files can be uploaded.');
+    } else {
+      setError(null);
     }
+
+    setSelectedFiles(mcapFiles);
+
+    // Allow selecting the same files again
+    e.currentTarget.value = '';
   };
 
   // Fetch a specific log by ID
@@ -719,7 +747,7 @@ export default function Home() {
       setIsEditModalOpen(false);
       setSelectedLog(null);
       // Still refetch to ensure we have the latest data
-      await fetchLogs();
+      await fetchLogs(currentPage, debouncedSearchQuery);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update log');
       console.error('Error updating log:', err);
@@ -747,7 +775,7 @@ export default function Home() {
 
       setIsDeleteModalOpen(false);
       setLogToDelete(null);
-      await fetchLogs();
+      await fetchLogs(currentPage, debouncedSearchQuery);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to delete log');
       console.error('Error deleting log:', err);
@@ -820,22 +848,80 @@ export default function Home() {
     }
   };
 
-  // Filter logs based on search query
-  const filteredLogs = logs.filter((log) => {
-    if (!searchQuery.trim()) return true;
-    
-    const query = searchQuery.toLowerCase();
-    return (
-      log.id.toString().includes(query) ||
-      getName(log.car).toLowerCase().includes(query) ||
-      getName(log.driver).toLowerCase().includes(query) ||
-      getName(log.event_type).toLowerCase().includes(query) ||
-      (log.notes && log.notes.toLowerCase().includes(query)) ||
-      (log.recovery_status && log.recovery_status.toLowerCase().includes(query)) ||
-      (log.parse_status && log.parse_status.toLowerCase().includes(query)) ||
-      (log.captured_at && new Date(log.captured_at).toLocaleString().toLowerCase().includes(query))
-    );
-  });
+  // Debounce search and fetch server-side results (search across ALL logs)
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearchQuery(searchQuery), 300);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    // Reset to page 1 on new search
+    setSelectedLogIds([]);
+    setCurrentPage(1);
+    fetchLogs(1, debouncedSearchQuery);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearchQuery]);
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+
+  const goToPage = (page: number) => {
+    const nextPage = Math.min(Math.max(1, page), totalPages);
+    setSelectedLogIds([]);
+    setCurrentPage(nextPage);
+    fetchLogs(nextPage, debouncedSearchQuery);
+  };
+
+  const terminalStatus = (s?: string) => {
+    if (!s) return false;
+    const v = s.toLowerCase();
+    return v === 'completed' || v === 'success' || v.startsWith('error');
+  };
+
+  // Poll for status updates while uploads are processing
+  useEffect(() => {
+    if (processingLogIds.length === 0) return;
+
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const ids = processingLogIds.slice();
+        if (ids.length === 0) return;
+
+        const results = await Promise.all(
+          ids.map(async (id) => {
+            const res = await fetch(`${API_BASE_URL}/mcap-logs/${id}/`);
+            if (!res.ok) return { id, log: null };
+            const log = await res.json();
+            return { id, log };
+          })
+        );
+
+        if (cancelled) return;
+
+        // Update visible rows in-place if they’re on the current page
+        setLogs((prev) => {
+          const byId = new Map(results.filter((r) => r.log).map((r) => [r.id, r.log]));
+          return prev.map((l) => (byId.has(l.id) ? { ...l, ...byId.get(l.id) } : l));
+        });
+
+        // Remove finished IDs
+        setProcessingLogIds((prev) =>
+          prev.filter((id) => {
+            const found = results.find((r) => r.id === id)?.log;
+            if (!found) return true;
+            return !(terminalStatus(found.recovery_status) && terminalStatus(found.parse_status));
+          })
+        );
+      } catch (_) {
+        // Keep polling; transient errors are fine
+      }
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [processingLogIds]);
 
   // Selection helpers
   const toggleSelectLog = (id: number) => {
@@ -845,7 +931,7 @@ export default function Home() {
   };
 
   const toggleSelectAll = () => {
-    const allIds = filteredLogs.map((log) => log.id);
+    const allIds = logs.map((log) => log.id);
     const allSelected = allIds.every((id) => selectedLogIds.includes(id)) && allIds.length > 0;
     if (allSelected) {
       setSelectedLogIds((prev) => prev.filter((id) => !allIds.includes(id)));
@@ -910,7 +996,7 @@ export default function Home() {
   // Fetch logs and lookups on component mount
   useEffect(() => {
     fetchLookups();
-    fetchLogs();
+    fetchLogs(1, '');
   }, []);
 
   return (
@@ -923,7 +1009,7 @@ export default function Home() {
         {/* Upload Section */}
         <Card className="mb-8 bg-white border border-gray-200 shadow-sm">
           <CardHeader>
-            <CardTitle className="text-gray-900">Upload MCAP File</CardTitle>
+            <CardTitle className="text-gray-900">Upload MCAP Files</CardTitle>
           </CardHeader>
           <CardContent>
           <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
@@ -931,34 +1017,73 @@ export default function Home() {
               <input
                 type="file"
                 accept=".mcap"
+                multiple
                 onChange={handleFileChange}
                 className="hidden"
                 disabled={uploading}
               />
                 <Button variant="outline" className="cursor-pointer border-gray-300 text-gray-700 hover:bg-gray-50" asChild>
-              <span>Select MCAP File</span>
+              <span>Select MCAP Files</span>
                 </Button>
             </label>
 
-            {selectedFile && (
+            {selectedFiles.length > 0 && (
               <div className="flex-1">
                 <p className="text-sm text-gray-600">
-                  Selected: <span className="font-medium text-gray-900">{selectedFile.name}</span>
+                  Selected: <span className="font-medium text-gray-900">{selectedFiles.length}</span> file{selectedFiles.length === 1 ? '' : 's'}
                 </p>
                 <p className="text-xs text-gray-500">
-                  Size: {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
+                  Total size:{' '}
+                  {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / 1024 / 1024).toFixed(2)} MB
                 </p>
+                <div className="mt-2 space-y-1">
+                  {selectedFiles.slice(0, 5).map((file, idx) => (
+                    <div key={`${file.name}-${file.size}-${idx}`} className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-gray-700 truncate">{file.name}</span>
+                      <button
+                        type="button"
+                        className="text-xs text-purple-700 hover:text-purple-900"
+                        onClick={() => removeSelectedFileAtIndex(idx)}
+                        disabled={uploading}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                  {selectedFiles.length > 5 && (
+                    <div className="text-xs text-gray-500">
+                      + {selectedFiles.length - 5} more…
+                    </div>
+                  )}
+                </div>
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    className="text-xs text-gray-600 hover:text-gray-900"
+                    onClick={clearSelectedFiles}
+                    disabled={uploading}
+                  >
+                    Clear selection
+                  </button>
+                </div>
               </div>
             )}
 
               <Button
               onClick={handleUpload}
-              disabled={!selectedFile || uploading}
+              disabled={selectedFiles.length === 0 || uploading}
                 className="bg-purple-600 hover:bg-purple-700 text-white"
             >
               {uploading ? 'Uploading...' : 'Upload'}
               </Button>
           </div>
+
+          {processingLogIds.length > 0 && (
+            <div className="mt-4 rounded-md border border-purple-200 bg-purple-50 px-4 py-3 text-sm text-purple-900">
+              Processing {processingLogIds.length} file{processingLogIds.length === 1 ? '' : 's'}…
+              <span className="ml-2 text-purple-700">(recovery/parse running)</span>
+            </div>
+          )}
 
           {error && (
               <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
@@ -994,12 +1119,12 @@ export default function Home() {
                   )}
                 </Button>
                 <Button
-                onClick={fetchLogs}
-                disabled={loading}
+                  onClick={() => fetchLogs(currentPage, debouncedSearchQuery)}
+                  disabled={loading}
                   variant="outline"
                   className="border-gray-300 text-gray-700 hover:bg-gray-50"
-              >
-                {loading ? 'Refreshing...' : 'Refresh'}
+                >
+                  {loading ? 'Refreshing...' : 'Refresh'}
                 </Button>
               </div>
           </div>
@@ -1022,7 +1147,7 @@ export default function Home() {
             <div className="text-center py-8">
               <p className="text-gray-600">Loading logs...</p>
             </div>
-          ) : filteredLogs.length === 0 ? (
+          ) : logs.length === 0 ? (
             <div className="text-center py-8">
               <p className="text-gray-600">
                 {searchQuery ? `No logs found matching "${searchQuery}"` : 'No logs found. Upload a file to get started.'}
@@ -1038,8 +1163,8 @@ export default function Home() {
                         type="checkbox"
                         aria-label="Select all"
                         checked={
-                          filteredLogs.length > 0 &&
-                          filteredLogs.every((log) => selectedLogIds.includes(log.id))
+                          logs.length > 0 &&
+                          logs.every((log) => selectedLogIds.includes(log.id))
                         }
                         onChange={toggleSelectAll}
                       />
@@ -1058,7 +1183,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredLogs.map((log) => (
+                  {logs.map((log) => (
                     <tr
                       key={log.id}
                       className="hover:bg-gray-50 transition-colors"
@@ -1186,6 +1311,76 @@ export default function Home() {
                   ))}
                 </tbody>
               </table>
+
+              {/* Pagination */}
+              <div className="mt-4 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div className="text-sm text-gray-600">
+                  Page <span className="font-medium text-gray-900">{currentPage}</span> of{' '}
+                  <span className="font-medium text-gray-900">{totalPages}</span> •{' '}
+                  <span className="font-medium text-gray-900">{totalCount}</span> total logs
+                </div>
+                <div className="flex items-center gap-1 flex-wrap justify-end">
+                  <Button
+                    variant="outline"
+                    className="border-gray-300 text-gray-700 hover:bg-gray-50"
+                    disabled={currentPage <= 1 || loading}
+                    onClick={() => goToPage(currentPage - 1)}
+                  >
+                    Prev
+                  </Button>
+
+                  {(() => {
+                    const pages: (number | 'dots')[] = [];
+                    const maxButtons = 7;
+                    if (totalPages <= maxButtons) {
+                      for (let p = 1; p <= totalPages; p++) pages.push(p);
+                    } else {
+                      const start = Math.max(2, currentPage - 2);
+                      const end = Math.min(totalPages - 1, currentPage + 2);
+                      pages.push(1);
+                      if (start > 2) pages.push('dots');
+                      for (let p = start; p <= end; p++) pages.push(p);
+                      if (end < totalPages - 1) pages.push('dots');
+                      pages.push(totalPages);
+                    }
+
+                    return pages.map((p, idx) => {
+                      if (p === 'dots') {
+                        return (
+                          <span key={`dots-${idx}`} className="px-2 text-gray-400">
+                            …
+                          </span>
+                        );
+                      }
+                      const active = p === currentPage;
+                      return (
+                        <Button
+                          key={`page-${p}`}
+                          variant="outline"
+                          className={
+                            active
+                              ? 'border-purple-400 bg-purple-50 text-purple-900 hover:bg-purple-100'
+                              : 'border-gray-300 text-gray-700 hover:bg-gray-50'
+                          }
+                          disabled={loading}
+                          onClick={() => goToPage(p)}
+                        >
+                          {p}
+                        </Button>
+                      );
+                    });
+                  })()}
+
+                  <Button
+                    variant="outline"
+                    className="border-gray-300 text-gray-700 hover:bg-gray-50"
+                    disabled={currentPage >= totalPages || loading}
+                    onClick={() => goToPage(currentPage + 1)}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
             </div>
           )}
           </CardContent>

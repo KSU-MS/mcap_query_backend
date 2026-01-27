@@ -56,13 +56,28 @@ class McapLogViewSet(viewsets.ModelViewSet):
         queryset = McapLog.objects.all()
         
         # ===== TEXT SEARCH =====
-        # Search in file_name and notes fields (case-insensitive partial match)
-        # Example: ?search=race will find "race_log.mcap" or notes containing "race"
+        # Search across log + FK names (case-insensitive partial match)
+        # Example: ?search=race will find "race_log.mcap", notes containing "race",
+        # or related car/driver/event_type names containing "race".
         search = self.request.query_params.get('search', None)
         if search:
-            queryset = queryset.filter(
-                Q(file_name__icontains=search) | Q(notes__icontains=search)
-            )
+            search = str(search).strip()
+            if search:
+                q = (
+                    Q(file_name__icontains=search)
+                    | Q(notes__icontains=search)
+                    | Q(car__name__icontains=search)
+                    | Q(driver__name__icontains=search)
+                    | Q(event_type__name__icontains=search)
+                )
+
+                # If search is numeric, also match ID exactly
+                try:
+                    q = Q(id=int(search)) | q
+                except (ValueError, TypeError):
+                    pass
+
+                queryset = queryset.filter(q)
         
         # ===== DATE RANGE FILTERING =====
         # Filter logs by capture date range using captured_at field
